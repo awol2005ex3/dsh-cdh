@@ -566,12 +566,32 @@ function apply(ctx: any): void {
   win.__dshCdhMounted = true
 
   const handle = buildPanel(ctx, conn)
-  // 插槽注册在 inject 回调里异步生效；先记下是否已注册，未注册时启用 DOM 兜底。
-  // 面板是同一个 DOM 节点，插槽挂载时 appendChild 会把它从兜底容器搬过去，不会出现两份。
-  const slotted = tryRegisterSettingsSlot(ctx, handle, () => {})
+  // 插槽注册在 inject 回调里异步生效；注册成功前先用 DOM 兜底。
+  // ⚠ 两者必须互斥：`[data-slot="settings.section"]` 是所有设置分区**共享**的
+  // 单一容器（宿主按 only:active 渲染当前分区），面板一旦被兜底搬进去，
+  // 每个配置 tab 都会出现 CDH 配置项。onSlotted 里必须断开 observer。
+  let slotted = false
+  let observer: MutationObserver | undefined
 
+  function stopFallback(): void {
+    slotted = true
+    observer?.disconnect()
+    observer = undefined
+    const anchor = doc.querySelector('[data-dsh-cdh-settings]')
+    if (anchor) {
+      if (handle.root.parentElement !== anchor) anchor.appendChild(handle.root)
+    } else if (handle.root.parentElement) {
+      // 插槽组件还没挂载（对话框未开 / 未切到本 tab）：先摘除，
+      // 组件挂载时它的 effect 会把面板 append 回来。
+      handle.root.remove()
+    }
+  }
+
+  slotted = tryRegisterSettingsSlot(ctx, handle, stopFallback)
   if (!slotted) {
-    const observer = new MutationObserver(() => mountPanelInSettings(handle.root, handle.refresh))
+    observer = new MutationObserver(() => {
+      if (!slotted) mountPanelInSettings(handle.root, handle.refresh)
+    })
     observer.observe(doc.documentElement, { childList: true, subtree: true })
   }
 }
