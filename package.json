@@ -1,0 +1,71 @@
+{
+  "name": "dsh-cdh",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (dsh) plugin: 只读诊断 Cloudera Manager / CDH 集群（连接信息在插件设置页配置，提供 cdh agent 工具）。",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/client.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "license": "Apache-2.0",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/wrap-client.mjs",
+    "typecheck": "tsc --noEmit",
+    "check:plugin": "npm run build && node scripts/check-plugin.mjs",
+    "check:parse": "npm run build && node scripts/check-parse.mjs",
+    "check:client": "npm run build && node scripts/check-client.mjs",
+    "check": "npm run check:plugin && npm run check:parse && npm run check:client",
+    "test": "npm run check"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cloudera",
+    "cdh",
+    "cloudera-manager",
+    "diagnosis",
+    "ops",
+    "troubleshooting"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  }
+}
