@@ -80,6 +80,57 @@ export function analyzeHealthChecks(entity: unknown): {
   return { healthSummary, problemCount: problems.length, problems }
 }
 
+/**
+ * 运行状态是否构成问题（返回说明文本；不构成问题时返回 undefined）。
+ *
+ * 以 CM 自身语义（`ApiEntityStatus`，v11+）为准，避免我们自己臆断"应该在跑"：
+ * - `DOWN`：CM 判定"应运行而未运行"，才是异常；
+ * - `STOPPED`：按预期停止（用户手动停止的服务/角色），不报；
+ * - `NONE`：无状态组件（纯 client / gateway 角色、client-only 服务），根本不存在
+ *   "运行中"的概念，不期待 STARTED/BUSY；
+ * - 其余取值（健康类、STARTING/STOPPING、UNKNOWN）：CM 未判定为 DOWN，不额外判罪，
+ *   真正的健康问题由 `analyzeHealthChecks` 那条通道兜底。
+ *
+ * `entityStatus` 缺失（旧 API / 视图未返回）时回退到 `serviceState` / `roleState`：
+ * `NA` 与 `STOPPED` 视为"不期待运行"不报，其余非 STARTED/BUSY 才报。
+ */
+export function runStateIssue(entity: unknown, kind: 'service' | 'role'): string | undefined {
+  const row = obj(entity)
+  const stateKey = kind === 'service' ? 'serviceState' : 'roleState'
+  const runningStates = kind === 'service' ? ['STARTED'] : ['STARTED', 'BUSY']
+  const label = kind === 'service' ? '服务' : '角色'
+  const state = str(row[stateKey], 'UNKNOWN')
+  const upper = state.toUpperCase()
+  const entityStatus = str(row.entityStatus).toUpperCase()
+
+  if (entityStatus === 'DOWN') {
+    return `${label}状态为 ${state}，CM 判定应处于运行状态（entityStatus=DOWN）`
+  }
+  if (entityStatus) return undefined
+  if (upper === 'NA' || upper === 'STOPPED') return undefined
+  if (runningStates.includes(upper)) return undefined
+  return `${label}状态为 ${state}，预期 ${runningStates.join(' 或 ')}`
+}
+
+/**
+ * 主机运行状态是否构成问题（返回说明文本；不构成问题时返回 undefined）。
+ *
+ * `ApiHost` 上没有 `status` 字段（历史 bug：读它永远得到 UNKNOWN，导致每台主机都被误报），
+ * 事实来源是 `entityStatus`（v11+，与 CM UI 状态列同源）：
+ * - `DOWN`：CM 判定应在线而未运行（Agent 停止/离线），报 BAD；
+ * - `STOPPED`：按预期停止，不报；
+ * - 健康类取值（GOOD_HEALTH / CONCERNING_HEALTH / BAD_HEALTH 等）表达的是健康而非
+ *   运行状态，交给 `analyzeHealthChecks` 归纳，这里不重复判罪；
+ * - `entityStatus` 缺失（API < v11）时不臆断，返回 undefined。
+ */
+export function hostStatusIssue(host: unknown): string | undefined {
+  const status = str(obj(host).entityStatus).toUpperCase()
+  if (status === 'DOWN') {
+    return 'CM 判定主机应在线但未运行（entityStatus=DOWN），Agent 可能已停止'
+  }
+  return undefined
+}
+
 /** 统一成功包装（与参考实现的 `{success:true,data:...}` 形态不同——工具直接返回 data）。 */
 export function notAvailable(what: string): never {
   throw new Error(`${what} 不可用`)

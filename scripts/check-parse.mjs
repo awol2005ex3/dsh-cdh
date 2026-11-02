@@ -35,6 +35,29 @@ assert.equal(
 assert.equal(analysis.ratioPercent(50, 100), 50)
 assert.equal(analysis.ratioPercent(1, 0), undefined)
 
+// runStateIssue：无状态组件 / 手动停止 / CM 判定 DOWN
+// 无状态（serviceState=NA，如纯 client 组件）不期待 STARTED
+assert.equal(analysis.runStateIssue({ serviceState: 'NA' }, 'service'), undefined)
+// 手动停止：entityStatus=STOPPED（按预期停止）不报；CM 判定应运行（DOWN）才报
+assert.equal(analysis.runStateIssue({ serviceState: 'STOPPED', entityStatus: 'STOPPED' }, 'service'), undefined)
+assert.match(analysis.runStateIssue({ serviceState: 'STOPPED', entityStatus: 'DOWN' }, 'service'), /DOWN/)
+// 无状态角色（gateway/client，roleState=NA 或 entityStatus=NONE）不期待 STARTED
+assert.equal(analysis.runStateIssue({ roleState: 'NA', type: 'HDFS_GATEWAY' }, 'role'), undefined)
+assert.equal(analysis.runStateIssue({ roleState: 'STOPPED', entityStatus: 'NONE' }, 'role'), undefined)
+// 手动停服务后其角色（entityStatus=STOPPED）不报；服务 STARTED 而角色 STOPPED（DOWN）必报
+assert.equal(analysis.runStateIssue({ roleState: 'STOPPED', entityStatus: 'STOPPED' }, 'role'), undefined)
+assert.match(analysis.runStateIssue({ roleState: 'STOPPED', entityStatus: 'DOWN' }, 'role'), /角色状态/)
+// entityStatus 缺失时回退：STOPPED/NA 不报，其余非 STARTED/BUSY 仍报
+assert.equal(analysis.runStateIssue({ serviceState: 'STOPPED' }, 'service'), undefined)
+assert.equal(analysis.runStateIssue({ roleState: 'BUSY' }, 'role'), undefined)
+assert.match(analysis.runStateIssue({ roleState: 'STOPPING' }, 'role'), /STOPPING/)
+
+// hostStatusIssue：ApiHost 无 status 字段，状态判定只认 entityStatus
+assert.equal(analysis.hostStatusIssue({ entityStatus: 'GOOD_HEALTH' }), undefined)
+assert.equal(analysis.hostStatusIssue({ entityStatus: 'STOPPED' }), undefined)
+assert.equal(analysis.hostStatusIssue({}), undefined)
+assert.match(analysis.hostStatusIssue({ entityStatus: 'DOWN' }), /Agent/)
+
 // 事件查询语法规范化（与参考实现 events.rs 的单测对齐）
 const cases = [
   ['category=IMPALA_EVENT', 'category==IMPALA_EVENT'],

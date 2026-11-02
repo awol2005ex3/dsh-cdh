@@ -11,6 +11,7 @@ import {
   analyzeHealthChecks,
   bool,
   buildEventQuery,
+  hostStatusIssue,
   itemsOf,
   latestValue,
   metricLatest,
@@ -19,6 +20,7 @@ import {
   parseSeverity,
   ratioPercent,
   resolveClusterName,
+  runStateIssue,
   str,
   type HealthProblem,
   type Severity,
@@ -173,7 +175,8 @@ async function clusterAction(ctx: Context, action: string, args: Record<string, 
 
     case 'hosts': {
       const name = await clusterName(ctx, args)
-      return ctx.client.get(`/clusters/${encodeURIComponent(name)}/hosts`, [], ctx.signal)
+      // lastHeartbeat / healthSummary 等字段需 full 视图（CM 文档标注 Requires "full" view）
+      return ctx.client.get(`/clusters/${encodeURIComponent(name)}/hosts`, [['view', 'full']], ctx.signal)
     }
 
     case 'diagnose': {
@@ -204,7 +207,8 @@ async function clusterAction(ctx: Context, action: string, args: Record<string, 
         }
         if (health.healthSummary === 'BAD') badServices.push(entry)
         else if (health.healthSummary === 'CONCERNING') concerningServices.push(entry)
-        if (state.toUpperCase() !== 'STARTED') stoppedServices.push(serviceName)
+        // NA = 无状态服务（如纯 client 组件），从不"启动"，不列入未运行清单
+        if (state.toUpperCase() !== 'STARTED' && state.toUpperCase() !== 'NA') stoppedServices.push(serviceName)
         if (stale) staleServices.push(serviceName)
       }
 
@@ -269,8 +273,10 @@ async function serviceAction(ctx: Context, action: string, args: Record<string, 
             issues.push({ check: problem.name, severity: problem.summary, explanation: problem.explanation })
           }
         }
-        if (state.toUpperCase() !== 'STARTED') {
-          issues.push({ check: 'SERVICE_STATE', severity: 'BAD', explanation: `服务状态为 ${state}，预期 STARTED` })
+        // 手动停止（STOPPED=按预期停止）与无状态组件（NONE / serviceState=NA）不期待 STARTED
+        const stateIssue = runStateIssue(row, 'service')
+        if (stateIssue) {
+          issues.push({ check: 'SERVICE_STATE', severity: 'BAD', explanation: stateIssue })
         }
         if (stale) {
           issues.push({
@@ -322,15 +328,17 @@ async function serviceAction(ctx: Context, action: string, args: Record<string, 
 async function hostAction(ctx: Context, action: string, args: Record<string, unknown>): Promise<unknown> {
   switch (action) {
     case 'list':
-      return ctx.client.get('/hosts', [], ctx.signal)
+      // lastHeartbeat / healthSummary / healthChecks 均需 full 视图（CM 文档标注 Requires "full" view）
+      return ctx.client.get('/hosts', [['view', 'full']], ctx.signal)
 
     case 'get': {
       const hostId = requireStr(args, 'host_id', 'CM 的 hostId 或主机名')
-      return ctx.client.get(`/hosts/${encodeURIComponent(hostId)}`, [], ctx.signal)
+      return ctx.client.get(`/hosts/${encodeURIComponent(hostId)}`, [['view', 'full']], ctx.signal)
     }
 
     case 'diagnose': {
-      const resp = await ctx.client.get('/hosts', [], ctx.signal)
+      // 不带 view=full 时 CM 不返回 lastHeartbeat，历史上会把所有主机误判成"缺少心跳"
+      const resp = await ctx.client.get('/hosts', [['view', 'full']], ctx.signal)
       const items = itemsOf(resp)
       const findings: unknown[] = []
       const now = Date.now()
@@ -339,7 +347,9 @@ async function hostAction(ctx: Context, action: string, args: Record<string, unk
         const row = obj(host)
         const hostId = str(row.hostId, '?')
         const hostname = str(row.hostname, hostId)
-        const status = str(row.status, 'UNKNOWN')
+        // ApiHost 没有 status 字段，运行状态的事实来源是 entityStatus（v11+）
+        const entityStatus = str(row.entityStatus, 'UNKNOWN')
+        const health = analyzeHealthChecks(row)
         const maintenance = bool(row.maintenanceMode)
         const issues: Issue[] = []
 
@@ -363,15 +373,23 @@ async function hostAction(ctx: Context, action: string, args: Record<string, unk
             }
           }
         } else {
-          issues.push({ check: 'HEARTBEAT_MISSING', severity: 'CONCERNING', explanation: '缺少心跳时间字段' })
+          issues.push({
+            check: 'HEARTBEAT_MISSING',
+            severity: 'CONCERNING',
+            explanation: '缺少心跳时间字段（已按 view=full 查询，该主机可能从未上报过心跳）',
+          })
         }
 
-        if (!['HEALTHY', 'GOOD', 'NORMAL'].includes(status.toUpperCase())) {
-          issues.push({
-            check: 'HOST_STATUS',
-            severity: 'BAD',
-            explanation: `主机状态为 ${status}，非预期 HEALTHY`,
-          })
+        // 主机自身的健康检查（磁盘、时钟偏移等），与服务/角色诊断同一归纳通道
+        if (health.healthSummary === 'BAD' || health.healthSummary === 'CONCERNING') {
+          for (const problem of health.problems) {
+            issues.push({ check: problem.name, severity: problem.summary, explanation: problem.explanation })
+          }
+        }
+        // 只有 CM 判定"应在线而未运行"（DOWN）才算状态异常；STOPPED=按预期停止不报
+        const statusIssue = hostStatusIssue(row)
+        if (statusIssue) {
+          issues.push({ check: 'HOST_STATUS', severity: 'BAD', explanation: statusIssue })
         }
         if (maintenance) {
           issues.push({
@@ -385,7 +403,8 @@ async function hostAction(ctx: Context, action: string, args: Record<string, unk
         findings.push({
           hostId,
           hostname,
-          status,
+          entityStatus,
+          healthSummary: health.healthSummary,
           maintenanceMode: maintenance,
           issueCount: issues.length,
           issues,
@@ -443,8 +462,11 @@ async function roleAction(ctx: Context, action: string, args: Record<string, unk
             issues.push({ check: problem.name, severity: problem.summary, explanation: problem.explanation })
           }
         }
-        if (!['STARTED', 'BUSY'].includes(state.toUpperCase())) {
-          issues.push({ check: 'ROLE_STATE', severity: 'BAD', explanation: `角色状态为 ${state}，预期 STARTED` })
+        // client / gateway 等无状态角色（roleState=NA / entityStatus=NONE）与手动停止的服务
+        //（其角色随服务 STOPPED）不期待 STARTED；只有 CM 判定 DOWN 才是异常
+        const stateIssue = runStateIssue(row, 'role')
+        if (stateIssue) {
+          issues.push({ check: 'ROLE_STATE', severity: 'BAD', explanation: stateIssue })
         }
         if (stale) {
           issues.push({
