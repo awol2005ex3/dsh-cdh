@@ -29,6 +29,7 @@ export function createCdhTool(dispatch: Dispatch) {
       '{category:"events",action:"alerts",args:{hours:24,severities:["CRITICAL","ERROR"]}};',
       '{category:"metrics",action:"list",args:{filter:"dfs_",context:"SERVICE"}} 先查指标名再 query；',
       '{category:"diagnosis",action:"hdfs"} / "yarn" / "impala" 专项诊断。',
+      '写 metrics/query 的 tsquery 前先加载 skill "cdh-tsquery"（CM tsquery 语法、与 events/query 的区别、指标名核对）；',
       'cluster_name 省略时用插件默认集群，其次取 CM 上的第一个集群。',
     ].join(' '),
     parameters: {

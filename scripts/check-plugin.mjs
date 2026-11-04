@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 const effects = []
 const routes = new Map()
 const tools = []
+const skills = []
 
 const logger = Object.assign(
   (scope) => ({
@@ -43,17 +44,41 @@ const services = {
       }
     },
   },
-}
-
-const ctx = {
-  logger,
-  get: (name) => services[name],
-  effect(fn, label) {
-    const dispose = fn()
-    effects.push({ label, dispose })
-    return dispose
+  skills: {
+    register(skill) {
+      skills.push(skill)
+      return () => {
+        const index = skills.indexOf(skill)
+        if (index >= 0) skills.splice(index, 1)
+      }
+    },
   },
 }
+
+function makeCtx(servicesMap) {
+  return {
+    logger,
+    get: (name) => servicesMap[name],
+    // 属性访问（skills 服务）——与真实 cordis 的 inject 声明等价
+    get skills() {
+      return servicesMap.skills
+    },
+    effect(fn, label) {
+      const dispose = fn()
+      effects.push({ label, dispose })
+      return dispose
+    },
+    inject(deps, callback) {
+      assert.deepEqual(deps, ['skills'], 'skill must be assembled behind inject([skills])')
+      // 真实 cordis 会传入子 ctx（其 effect 随子 fiber 卸载）；这里构造独立子 ctx 贴近语义。
+      const child = { ...makeCtx(servicesMap), inject: undefined }
+      callback(child)
+      return { dispose: () => {} }
+    },
+  }
+}
+
+const ctx = makeCtx(services)
 
 const mod = await import('../lib/index.js')
 assert.equal(mod.name, 'dsh-cdh')
@@ -73,6 +98,18 @@ for (const [path, route] of routes) {
 // 工具
 assert.equal(tools.length, 1)
 assert.equal(tools[0].name, 'cdh')
+assert.match(tools[0].description, /cdh-tsquery/, '工具描述应提示先加载 tsquery skill')
+
+// 内置 skill：名称/来源/调用策略/正文来自 md 且非空
+assert.equal(skills.length, 1)
+assert.equal(skills[0].name, 'cdh-tsquery')
+assert.equal(skills[0].source, 'runtime')
+assert.deepEqual(skills[0].invocation, { modelInvocable: true, userInvocable: true })
+assert.ok(skills[0].description.length > 0, 'skill 需要 description')
+assert.ok(skills[0].content.length > 500, 'skill 正文应来自 skills/cdh-tsquery.md')
+assert.match(skills[0].content, /tsquery 不是 SQL/)
+assert.match(skills[0].content, /events\/query/)
+assert.match(skills[0].content, /metrics\/list/)
 
 // 信封：malformed 请求 → 400
 const diagnose = routes.get('/api/cdh/diagnose')
@@ -142,5 +179,19 @@ for (const { dispose } of effects.reverse()) {
 }
 assert.equal(routes.size, 0, 'routes must be disposed')
 assert.equal(tools.length, 0, 'tools must be disposed')
+assert.equal(skills.length, 0, 'skills must be disposed')
+
+// 降级：skills 服务缺席（老宿主）不应影响 RPC 路由与 cdh 工具
+const legacyCtx = makeCtx({ ...services, skills: undefined })
+const legacyEffects = effects.length
+mod.apply(legacyCtx, { host: 'cm.example.com', port: 7180, username: 'admin', password: 'secret' })
+assert.equal(skills.length, 0, 'skills 缺席时不应注册 skill')
+assert.equal(tools.length, 1, 'skills 缺席时 cdh 工具仍应注册')
+assert.equal(routes.size, 3, 'skills 缺席时 RPC 路由仍应注册')
+for (const { dispose } of effects.splice(legacyEffects).reverse()) {
+  if (typeof dispose === 'function') await dispose()
+}
+assert.equal(routes.size, 0)
+assert.equal(tools.length, 0)
 
 console.log('check-plugin: ok')

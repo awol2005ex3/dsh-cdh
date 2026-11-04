@@ -43,6 +43,8 @@ DeepSeek Harness (dsh) 插件，**只读**诊断 Cloudera Manager / CDH。
 | `src/service.ts` | 业务层 | `CDH_CATEGORIES` / `CDH_ACTIONS`、各 `*Action()`、`createDispatcher` |
 | `src/rpc.ts` | 传输层 | 端点表、信封编解码、`registerRpcRoutes` |
 | `src/tool.ts` | agent 工具 | `defineTool` 定义、参数校验、截断与错误折叠 |
+| `src/skill.ts` | 内置 skill | `cdh-tsquery` 的注册（`ctx.inject(['skills'])` 延迟装配）与常量 |
+| `skills/*.md` | 内置 skill 正文 | 原生 Markdown，随 npm 包发布；`skill.ts` 用 `new URL('../skills/…', import.meta.url)` 读取 |
 | `src/cm-client.ts` | HTTP 客户端 | URL 拼装、Basic Auth、超时/取消、`CmError` |
 | `src/analysis.ts` | 纯函数 | 健康度归纳、指标提取、事件查询语法规范化（无 IO，便于单测） |
 | `src/client.ts` | 浏览器半 | 设置面板 DOM、configForms/RPC 配置通道、插槽挂载降级 |

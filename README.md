@@ -8,6 +8,8 @@ DeepSeek Harness (dsh) 插件：**只读**诊断 Cloudera Manager / CDH 集群�
 - 只读：仅调用 CM REST API 的查询类接口，不执行任何会改集群状态的命令。
 - 零第三方运行时依赖：HTTP 走 Node 内置 `fetch`（Node ≥ 22.14.0）。
 - 配置热改即生效：全部字段 `volatile`，每个请求现读快照，改完无需重启。
+- 内置 `cdh-tsquery` skill：模型写 `metrics/query` 的 tsquery 前可加载，拿到 CM 官方 tsquery 语法、
+  与 `events/query` 语法的区别、指标名核对清单与可直接套用的调用示例（`skills/cdh-tsquery.md`）。
 
 ## 功能
 
@@ -26,6 +28,17 @@ DeepSeek Harness (dsh) 插件：**只读**诊断 Cloudera Manager / CDH 集群�
 
 `diagnosis/overview` 汇总服务、主机、告警三方面给出 0–100 健康评分与处理建议；
 `hdfs` / `yarn` / `impala` 为专项诊断（容量、副本、资源争抢、失败 SQL 聚合等）。
+
+### 内置 tsquery skill
+
+`metrics/query` 的 `tsquery` 是 Cloudera Manager 专有的时序查询语言，不是 SQL，且和同一个工具里
+`events/query` 的事件查询语法（`==` / `;`）极易混淆。插件注册一个全局 runtime skill `cdh-tsquery`：
+
+- 触发：`cdh` 工具描述里点名；任务涉及 tsquery 时模型主动 `skill("cdh-tsquery")` 加载正文。
+- 正文：`skills/cdh-tsquery.md`（原生 Markdown，随 npm 包发布），结论以 Cloudera 官方
+  [tsquery Language](https://docs-archive.cloudera.com/documentation/enterprise/6/6.3/topics/cm_dg_tsquery.html) 为准。
+- 装配：`src/skill.ts` 用 `ctx.inject(['skills'])` 延迟注册（服务缺席/晚挂载只降级掉这个增强功能，
+  不影响 RPC 路由和 `cdh` 工具，故不写进顶层 `inject`），`ctx.effect` 保证 HMR/卸载反注册。
 
 ## 架构
 
@@ -72,8 +85,8 @@ npm run check        # 全部冒烟（= npm test）
 
 三个冒烟脚本都不联网、不依赖真实 CM：
 
-- `check:plugin` — 假 cordis ctx 驱动真实插件：路由注册/信封、工具注册、错误分支、disposer 清空、settings 不回传密码。
-- `check:parse` — 分析层纯逻辑：健康度归纳、事件查询语法规范化、分类/动作表自洽。
+- `check:plugin` — 假 cordis ctx 驱动真实插件：路由注册/信封、工具注册、内置 skill 注册与降级、错误分支、disposer 清空、settings 不回传密码。
+- `check:parse` — 分析层纯逻辑：健康度归纳、事件查询语法规范化、分类/动作表自洽、skill 正文关键点断言。
 - `check:client` — 浏览器 bundle 契约：无 ESM 语法、`window.__ModuleLoader__.load` 工厂可执行并导出 `{ name, inject, apply }`。
 
 ### 目录
@@ -87,7 +100,9 @@ src/
   tool.ts       cdh agent 工具定义
   cm-client.ts  Cloudera Manager REST 客户端
   analysis.ts   健康度/指标/事件查询等公共逻辑
+  skill.ts      内置 cdh-tsquery skill 的装配与常量
   client.ts     浏览器半设置面板（bundle 模块体）
+skills/         内置 skill 正文（cdh-tsquery.md，随发布物打包）
 scripts/        构建包装与三个冒烟脚本
 ```
 

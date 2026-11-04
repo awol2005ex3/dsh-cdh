@@ -2,6 +2,7 @@
  * 冒烟：纯逻辑（分析层）单元校验，不联网、不依赖 cordis。
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 const analysis = await import('../lib/analysis.js')
 
@@ -111,5 +112,22 @@ const dispatch = service.createDispatcher(() => ({
   defaultCluster: '',
 }))
 await assert.rejects(() => dispatch('connection', 'test', {}), /未配置 Cloudera Manager 连接/)
+
+// 内置 skill：名称/描述是纯常量，正文 md 是发布物且覆盖关键纠错点
+const skill = await import('../lib/skill.js')
+assert.equal(skill.CDH_TSQUERY_SKILL, 'cdh-tsquery')
+assert.ok(skill.CDH_TSQUERY_SKILL_DESCRIPTION.length > 0)
+assert.ok(skill.CDH_TSQUERY_SKILL_DESCRIPTION.length <= 500, 'catalog 描述会被 500 字符截断')
+const md = readFileSync(new URL('../skills/cdh-tsquery.md', import.meta.url), 'utf8')
+for (const must of [
+  'SELECT <metric expression>', // 语法骨架
+  'events/query', // 与事件查询语法的区分
+  'from', // 时间窗口走独立参数
+  'metrics/list', // 指标名先查
+  'rlike', // 谓词
+  'under_replicated_blocks', // CDH 7 改名
+]) {
+  assert.ok(md.includes(must), `skill 正文缺少关键点: ${must}`)
+}
 
 console.log('check-parse: ok')
