@@ -30,6 +30,10 @@ export function createCdhTool(dispatch: Dispatch) {
       '{category:"metrics",action:"list",args:{filter:"dfs_",context:"SERVICE"}} 先查指标名再 query；',
       '{category:"diagnosis",action:"hdfs"} / "yarn" / "impala" 专项诊断。',
       '写 metrics/query 的 tsquery 前先加载 skill "cdh-tsquery"（CM tsquery 语法、与 events/query 的区别、指标名核对）；',
+      '按故障现象加载排查 skill（各含 cdh 取证序列 + 需运维在主机补执行的命令）：',
+      'CPU/load/iowait → "cdh-host-cpu"；内存/swap/主机 OOM 前兆 → "cdh-host-memory"；',
+      '磁盘 IO/容量/掉盘 → "cdh-disk-io"；进程无故消失/时钟/fd/内核参数 → "cdh-linux-kernel"；',
+      'Java OOME/GC 停顿/角色重启 → "cdh-jvm-oom"。',
       'cluster_name 省略时用插件默认集群，其次取 CM 上的第一个集群。',
     ].join(' '),
     parameters: {

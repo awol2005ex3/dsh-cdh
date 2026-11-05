@@ -113,11 +113,29 @@ const dispatch = service.createDispatcher(() => ({
 }))
 await assert.rejects(() => dispatch('connection', 'test', {}), /未配置 Cloudera Manager 连接/)
 
-// 内置 skill：名称/描述是纯常量，正文 md 是发布物且覆盖关键纠错点
+// 内置 skills：注册清单是事实来源，名称/描述合法、正文 md 是发布物且覆盖关键纠错点
 const skill = await import('../lib/skill.js')
 assert.equal(skill.CDH_TSQUERY_SKILL, 'cdh-tsquery')
 assert.ok(skill.CDH_TSQUERY_SKILL_DESCRIPTION.length > 0)
 assert.ok(skill.CDH_TSQUERY_SKILL_DESCRIPTION.length <= 500, 'catalog 描述会被 500 字符截断')
+assert.ok(Array.isArray(skill.BUILTIN_SKILLS))
+assert.equal(
+  skill.BUILTIN_SKILLS.length,
+  6,
+  '新增/删除内置 skill 时本断言与 check-plugin.mjs 的 EXPECTED_SKILLS 必须同步',
+)
+const skillNames = skill.BUILTIN_SKILLS.map((s) => s.name)
+assert.equal(new Set(skillNames).size, skillNames.length, 'skill 名不得重复')
+for (const def of skill.BUILTIN_SKILLS) {
+  assert.match(def.name, /^[a-z][a-z0-9-]*$/, `skill 名须 kebab-case: ${def.name}`)
+  assert.ok(def.description.length > 0, `${def.name} 需要 description`)
+  assert.ok(def.description.length <= 500, `${def.name} catalog 描述会被 500 字符截断`)
+  assert.match(def.file, /^cdh-[a-z-]+\.md$/, `${def.name} 正文文件名`)
+  const md = readFileSync(new URL(`../skills/${def.file}`, import.meta.url), 'utf8')
+  assert.ok(md.length > 500, `${def.name} 正文过短`)
+  assert.match(md, /^# /, `${def.name} 正文应有标题`)
+  assert.match(md, /cdh/, `${def.name} 正文应含 cdh 调用示例`)
+}
 const md = readFileSync(new URL('../skills/cdh-tsquery.md', import.meta.url), 'utf8')
 for (const must of [
   'SELECT <metric expression>', // 语法骨架

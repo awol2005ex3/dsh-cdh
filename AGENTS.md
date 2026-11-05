@@ -43,8 +43,8 @@ DeepSeek Harness (dsh) 插件，**只读**诊断 Cloudera Manager / CDH。
 | `src/service.ts` | 业务层 | `CDH_CATEGORIES` / `CDH_ACTIONS`、各 `*Action()`、`createDispatcher` |
 | `src/rpc.ts` | 传输层 | 端点表、信封编解码、`registerRpcRoutes` |
 | `src/tool.ts` | agent 工具 | `defineTool` 定义、参数校验、截断与错误折叠 |
-| `src/skill.ts` | 内置 skill | `cdh-tsquery` 的注册（`ctx.inject(['skills'])` 延迟装配）与常量 |
-| `skills/*.md` | 内置 skill 正文 | 原生 Markdown，随 npm 包发布；`skill.ts` 用 `new URL('../skills/…', import.meta.url)` 读取 |
+| `src/skill.ts` | 内置 skills | `BUILTIN_SKILLS` 注册清单（名称/catalog 描述/正文文件的事实来源）+ `registerBuiltinSkills()`（`ctx.inject(['skills'])` 延迟装配，每个 skill 一个 `ctx.effect`） |
+| `skills/*.md` | 内置 skill 正文 | 原生 Markdown，随 npm 包发布；`skill.ts` 用 `new URL('../skills/…', import.meta.url)` 逐个读取，读失败只跳过该 skill |
 | `src/cm-client.ts` | HTTP 客户端 | URL 拼装、Basic Auth、超时/取消、`CmError` |
 | `src/analysis.ts` | 纯函数 | 健康度归纳、指标提取、事件查询语法规范化（无 IO，便于单测） |
 | `src/client.ts` | 浏览器半 | 设置面板 DOM、configForms/RPC 配置通道、插槽挂载降级 |
@@ -60,6 +60,16 @@ DeepSeek Harness (dsh) 插件，**只读**诊断 Cloudera Manager / CDH。
 4. 时序指标优先走 `safeTimeseries()`；CDH 7 指标改名见 `service.ts` 内注释（如 `under_replicated_blocks`、`yarn_reports_containers_allocated_*`）。
 5. 在 `scripts/check-parse.mjs` 补断言（动作表自洽 + 纯逻辑分支），确保 `npm run check` 覆盖。
 6. 更新 `README.md` 的分类表与 `tool.ts` 里的常用示例。
+
+## 新增一个内置 skill 的步骤
+
+1. 在 `skills/` 放同名 `cdh-xxx.md` 正文：必须写清「只读边界」（CM 侧用 cdh 取证 / 主机侧命令交运维）、
+   固定取证序列（用真实 `category/action` 与参数名）、判读要点、与相邻 skill 的分流、需运维补执行的命令。
+2. 在 `src/skill.ts` 的 `BUILTIN_SKILLS` 加一行（`name` kebab-case、`description` ≤500 字符、`file` 同名 md）。
+   注册逻辑/降级/反注册全部复用，禁止为单个 skill 复制一遍 `ctx.inject(['skills'])` 装配代码。
+3. 在 `src/tool.ts` 描述里按现象点名新 skill（模型据此知道何时加载）。
+4. 同步 `scripts/check-plugin.mjs` 的 `EXPECTED_SKILLS` 与 `scripts/check-parse.mjs` 的数量/关键点断言。
+5. 更新 `README.md` 的内置 skills 表。
 
 ## 新增一个 RPC 端点的步骤
 

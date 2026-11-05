@@ -100,16 +100,37 @@ assert.equal(tools.length, 1)
 assert.equal(tools[0].name, 'cdh')
 assert.match(tools[0].description, /cdh-tsquery/, '工具描述应提示先加载 tsquery skill')
 
-// 内置 skill：名称/来源/调用策略/正文来自 md 且非空
-assert.equal(skills.length, 1)
-assert.equal(skills[0].name, 'cdh-tsquery')
-assert.equal(skills[0].source, 'runtime')
-assert.deepEqual(skills[0].invocation, { modelInvocable: true, userInvocable: true })
-assert.ok(skills[0].description.length > 0, 'skill 需要 description')
-assert.ok(skills[0].content.length > 500, 'skill 正文应来自 skills/cdh-tsquery.md')
-assert.match(skills[0].content, /tsquery 不是 SQL/)
-assert.match(skills[0].content, /events\/query/)
-assert.match(skills[0].content, /metrics\/list/)
+// 内置 skills：全部注册、来源/调用策略/正文来自 md 且非空
+const EXPECTED_SKILLS = [
+  'cdh-tsquery',
+  'cdh-host-cpu',
+  'cdh-host-memory',
+  'cdh-disk-io',
+  'cdh-linux-kernel',
+  'cdh-jvm-oom',
+]
+assert.deepEqual(skills.map((s) => s.name).sort(), [...EXPECTED_SKILLS].sort(), '所有内置 skill 都应注册')
+for (const skill of skills) {
+  assert.equal(skill.source, 'runtime', `${skill.name} source`)
+  assert.deepEqual(skill.invocation, { modelInvocable: true, userInvocable: true }, `${skill.name} invocation`)
+  assert.ok(skill.description.length > 0, `${skill.name} 需要 description`)
+  assert.ok(skill.description.length <= 500, `${skill.name} catalog 描述会被 500 字符截断`)
+  assert.ok(skill.content.length > 500, `${skill.name} 正文应来自 skills/*.md`)
+}
+const byName = Object.fromEntries(skills.map((s) => [s.name, s.content]))
+assert.match(byName['cdh-tsquery'], /tsquery 不是 SQL/)
+assert.match(byName['cdh-tsquery'], /events\/query/)
+assert.match(byName['cdh-tsquery'], /metrics\/list/)
+assert.match(byName['cdh-host-cpu'], /iowait/)
+assert.match(byName['cdh-host-memory'], /OOM killer/)
+assert.match(byName['cdh-disk-io'], /diagnosis\/hdfs/)
+assert.match(byName['cdh-linux-kernel'], /dmesg/)
+assert.match(byName['cdh-jvm-oom'], /OutOfMemoryError/)
+
+// 工具描述应把所有排查 skill 都点名（模型才知道何时加载）
+for (const name of EXPECTED_SKILLS) {
+  assert.match(tools[0].description, new RegExp(name), `工具描述应提示 skill ${name}`)
+}
 
 // 信封：malformed 请求 → 400
 const diagnose = routes.get('/api/cdh/diagnose')

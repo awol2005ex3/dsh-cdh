@@ -19,7 +19,7 @@ import { CdhConfigSchema, readCdhSettings, type CdhConfig } from './settings.js'
 import { createDispatcher } from './service.js'
 import { createRpcDispatcher, registerRpcRoutes } from './rpc.js'
 import { createCdhTool } from './tool.js'
-import { registerCdhTsquerySkill } from './skill.js'
+import { registerBuiltinSkills } from './skill.js'
 
 /** Plugin id — must be unique within the composed plugin tree. */
 export const name = 'dsh-cdh'
@@ -70,8 +70,8 @@ export function apply(ctx: Context, config: CdhConfig): void {
     }
   }, 'cdh: agent tool')
 
-  // ── 内置 skill（教模型写对 metrics/query 的 tsquery）──────────────────────
-  // 走 ctx.inject(['skills']) 延迟装配：skills 服务缺席时只降级掉这个增强功能，
+  // ── 内置 skills（CPU/内存/IO/内核/JVM OOM 排查 + tsquery 语法）─────────────
+  // 走 ctx.inject(['skills']) 延迟装配：skills 服务缺席时只降级掉这些增强功能，
   // 不影响上面的 RPC 路由与 cdh 工具（故不写进顶层 inject）。
-  registerCdhTsquerySkill(ctx)
+  registerBuiltinSkills(ctx)
 }

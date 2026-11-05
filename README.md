@@ -5,11 +5,11 @@ DeepSeek Harness (dsh) 插件：**只读**诊断 Cloudera Manager / CDH 集群�
 连接信息在插件设置页配置（host / port / 账号 / 密码 / TLS / API 版本 / 超时 / 默认集群），
 提供一个 `cdh` agent 工具与一组 `/api/cdh/*` RPC 端点，供模型和设置面板共用同一条诊断链路。
 
-- 只读：仅调用 CM REST API 的查询类接口，不执行任何会改集群状态的命令。
+- 只读：仅调用 CM REST API 的查询类接口，不执行任何会改集群状态的命令，**也不能登录主机执行命令**。
 - 零第三方运行时依赖：HTTP 走 Node 内置 `fetch`（Node ≥ 22.14.0）。
 - 配置热改即生效：全部字段 `volatile`，每个请求现读快照，改完无需重启。
-- 内置 `cdh-tsquery` skill：模型写 `metrics/query` 的 tsquery 前可加载，拿到 CM 官方 tsquery 语法、
-  与 `events/query` 语法的区别、指标名核对清单与可直接套用的调用示例（`skills/cdh-tsquery.md`）。
+- 内置 6 个排查 skill：模型按故障现象按需加载，每张卡给出「cdh 工具取证序列 + 判读要点 +
+  需运维在主机补执行的命令清单」（`skills/*.md`），见下表。
 
 ## 功能
 
@@ -29,16 +29,34 @@ DeepSeek Harness (dsh) 插件：**只读**诊断 Cloudera Manager / CDH 集群�
 `diagnosis/overview` 汇总服务、主机、告警三方面给出 0–100 健康评分与处理建议；
 `hdfs` / `yarn` / `impala` 为专项诊断（容量、副本、资源争抢、失败 SQL 聚合等）。
 
-### 内置 tsquery skill
+### 内置排查 skills
 
-`metrics/query` 的 `tsquery` 是 Cloudera Manager 专有的时序查询语言，不是 SQL，且和同一个工具里
-`events/query` 的事件查询语法（`==` / `;`）极易混淆。插件注册一个全局 runtime skill `cdh-tsquery`：
+CDH 故障里大量涉及 CPU / 内存 / IO / Linux 内核 / Java 进程 OOM 的排查。插件把运维知识拆成
+按「故障现象」切分的 runtime skills，模型命中一张卡即可拿到完整取证序列，不必每次重推一遍：
 
-- 触发：`cdh` 工具描述里点名；任务涉及 tsquery 时模型主动 `skill("cdh-tsquery")` 加载正文。
-- 正文：`skills/cdh-tsquery.md`（原生 Markdown，随 npm 包发布），结论以 Cloudera 官方
-  [tsquery Language](https://docs-archive.cloudera.com/documentation/enterprise/6/6.3/topics/cm_dg_tsquery.html) 为准。
-- 装配：`src/skill.ts` 用 `ctx.inject(['skills'])` 延迟注册（服务缺席/晚挂载只降级掉这个增强功能，
-  不影响 RPC 路由和 `cdh` 工具，故不写进顶层 `inject`），`ctx.effect` 保证 HMR/卸载反注册。
+| Skill | 触发现象 | 正文 |
+| --- | --- | --- |
+| `cdh-tsquery` | 写/调 `metrics/query` 的 tsquery、检索指标名 | [skills/cdh-tsquery.md](skills/cdh-tsquery.md) |
+| `cdh-host-cpu` | CPU 高 / load 飙高 / iowait / 单角色吃满 CPU | [skills/cdh-host-cpu.md](skills/cdh-host-cpu.md) |
+| `cdh-host-memory` | 内存水位 / swap 换页 / 主机级 OOM 前兆 | [skills/cdh-host-memory.md](skills/cdh-host-memory.md) |
+| `cdh-disk-io` | IO 延迟 / 磁盘将满 / DataNode 掉盘 / HDFS 变慢 | [skills/cdh-disk-io.md](skills/cdh-disk-io.md) |
+| `cdh-linux-kernel` | 进程无故消失 / 时钟偏移 / fd 耗尽 / 内核参数核对 | [skills/cdh-linux-kernel.md](skills/cdh-linux-kernel.md) |
+| `cdh-jvm-oom` | `OutOfMemoryError` / GC 停顿 / 角色僵死或重启 | [skills/cdh-jvm-oom.md](skills/cdh-jvm-oom.md) |
+
+设计要点：
+
+- **只读边界**：插件只能读 CM REST API。每张卡都明确区分「CM 侧用 cdh 取证」与
+  「需运维在目标主机补执行的命令（top/vmstat/iostat/dmesg/jcmd 等）」，不假装能登录主机。
+- **交叉分流**：卡内互相引用，避免把内核 OOM killer 误判成 JVM 堆 OOM、把 iowait 误判成 CPU 瓶颈、
+  把 `events/query` 语法误用进 tsquery。
+- **触发**：`cdh` 工具描述逐一点名；任务命中现象时模型 `skill("<name>")` 加载正文。
+- **正文**：`skills/*.md`（原生 Markdown，随 npm 包发布）。tsquery 结论以 Cloudera 官方
+  [tsquery Language](https://docs-archive.cloudera.com/documentation/enterprise/6/6.3/topics/cm_dg_tsquery.html) 为准；
+  指标名一律以 `/timeseries/schema` 实际返回为准（先 `metrics/list` 再写查询）。
+- **装配**：`src/skill.ts` 的 `BUILTIN_SKILLS` 是事实来源（名称 / catalog 描述 / 正文文件一一对应），
+  用 `ctx.inject(['skills'])` 延迟注册，每个 skill 一个 `ctx.effect` 保证 HMR/卸载反注册；
+  服务缺席/晚挂载只降级掉这些增强功能，不影响 RPC 路由和 `cdh` 工具（故不写进顶层 `inject`）。
+  新增一个主题：清单加一行 + `skills/` 放同名 md + 同步两个冒烟脚本的断言即可。
 
 ## 架构
 
@@ -100,9 +118,9 @@ src/
   tool.ts       cdh agent 工具定义
   cm-client.ts  Cloudera Manager REST 客户端
   analysis.ts   健康度/指标/事件查询等公共逻辑
-  skill.ts      内置 cdh-tsquery skill 的装配与常量
+  skill.ts      内置 skills 的注册清单（BUILTIN_SKILLS）与装配
   client.ts     浏览器半设置面板（bundle 模块体）
-skills/         内置 skill 正文（cdh-tsquery.md，随发布物打包）
+skills/         内置 skill 正文（6 个 *.md，随发布物打包）
 scripts/        构建包装与三个冒烟脚本
 ```
 
