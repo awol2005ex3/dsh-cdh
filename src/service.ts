@@ -7,21 +7,30 @@
  * 校验、错误折叠、配置解析只实现一次。
  */
 import { CmClient, CmError, truncate, type QueryParams } from './cm-client.js'
+import { YarnClient } from './yarn-client.js'
 import {
   analyzeHealthChecks,
   bool,
   buildEventQuery,
+  deriveYarnUrlsFromProps,
+  extractErrorLines,
+  extractLogText,
   hostStatusIssue,
   itemsOf,
+  latestAttempt,
   latestValue,
   metricLatest,
   num,
   obj,
+  parseAggregatedLogsPath,
+  parseHadoopConfigXml,
   parseSeverity,
   ratioPercent,
   resolveClusterName,
+  rmAppAttempts,
   runStateIssue,
   str,
+  webappAddressToUrl,
   type HealthProblem,
   type Severity,
 } from './analysis.js'
@@ -43,6 +52,7 @@ export const CDH_CATEGORIES = [
   'events',
   'metrics',
   'diagnosis',
+  'yarn',
 ] as const
 
 export type CdhCategory = (typeof CDH_CATEGORIES)[number]
@@ -57,6 +67,7 @@ export const CDH_ACTIONS: Record<CdhCategory, readonly string[]> = {
   events: ['query', 'alerts', 'build_query'],
   metrics: ['query', 'list', 'service', 'host'],
   diagnosis: ['overview', 'hdfs', 'yarn', 'impala', 'command_status', 'command_logs'],
+  yarn: ['apps', 'app', 'attempts', 'logs', 'diagnose'],
 }
 
 /** 分发器（浏览器 RPC 与 agent 工具共用）。 */
@@ -64,6 +75,7 @@ export type Dispatch = (category: string, action: string, args: Record<string, u
 
 interface Context {
   client: CmClient
+  yarn: YarnClient
   settings: CdhSettings
   signal?: AbortSignal
   /** 非致命的降级提示（例如指标名失效） */
@@ -1177,6 +1189,406 @@ async function diagnosisAction(ctx: Context, action: string, args: Record<string
   }
 }
 
+/* ── yarn（Spark/Flink/Hive on YARN 作业与容器日志取证） ─────────────────── */
+
+/** JHS 取日志末尾的字节 chunk：按行数估算并夹取到文本上限内（start 取负值=从末尾取）。 */
+function logChunkBytes(lines: number): number {
+  return Math.min(MAX_TEXT_CHARS, Math.max(8192, lines * 512))
+}
+
+/** 定位 YARN 服务名（yarn/apps 走 CM yarnApplications 需要）。 */
+async function yarnServiceName(ctx: Context, args: Record<string, unknown>): Promise<{ cluster: string; service: string }> {
+  const cluster = await clusterName(ctx, args)
+  const explicit = str(args.service_name).trim()
+  const service = explicit || (await findServiceName(ctx, cluster, 'YARN'))
+  if (!service) throw new Error('未找到 YARN 服务（可用 service_name 显式指定）')
+  return { cluster, service }
+}
+
+/** 要求已配置 ResourceManager Web 地址，否则给出可读纠正提示。 */
+function requireRm(ctx: Context): void {
+  if (!ctx.yarn.hasRm) {
+    throw new Error(
+      '该动作需要 ResourceManager Web 地址：请在设置 → 插件 → CDH 填 yarnRmUrl（如 http://rm:8088），或确保插件能读到 YARN 服务的 yarn-site.xml 自动推导；仅支持免 Kerberos（SPNEGO）的 HTTP 端点',
+    )
+  }
+}
+
+/** 解析角色所在主机名（webapp address 为 0.0.0.0 等绑定地址时用来替换 host）。 */
+async function resolveRoleHostname(ctx: Context, hostId: string): Promise<string> {
+  if (!hostId) return ''
+  const host = obj(await ctx.client.get(`/hosts/${encodeURIComponent(hostId)}`, [], ctx.signal))
+  return str(host.hostname)
+}
+
+/**
+ * 手动配置优先，留空时从 CM 自动推导 RM/JHS 地址：读一个 RESOURCEMANAGER 角色下发的
+ * yarn-site.xml，取 yarn.resourcemanager.webapp.address（RM）与 yarn.log.server.url（JHS）。
+ * 推导目标来自所配置集群自身的配置（非运行时传入 host），仍满足目标锁定不变量。
+ * 任何失败都降级为「仅手动配置」并记 warning，不拖垮 yarn 动作（apps 纯 CM，不调用本函数）。
+ */
+async function resolveYarnTargets(ctx: Context): Promise<void> {
+  if (ctx.yarn.hasRm && ctx.yarn.hasJhs) return
+  try {
+    const { cluster, service } = await yarnServiceName(ctx, {})
+    const rolesPath = `/clusters/${encodeURIComponent(cluster)}/services/${encodeURIComponent(service)}/roles`
+    const rolesResp = await ctx.client.get(rolesPath, [], ctx.signal)
+    const rmRole = itemsOf(rolesResp).map((r) => obj(r)).find((r) => str(r.type) === 'RESOURCEMANAGER')
+    if (!rmRole) throw new Error('YARN 服务下未找到 RESOURCEMANAGER 角色')
+    const roleName = str(rmRole.name)
+    const hostId = str(obj(rmRole.hostRef).hostId)
+    const xml = await ctx.client.requestText(
+      'GET',
+      `${rolesPath}/${encodeURIComponent(roleName)}/process/configFiles/yarn-site.xml`,
+      [],
+      ctx.signal,
+    )
+    const derived = deriveYarnUrlsFromProps(parseHadoopConfigXml(xml))
+    let rmUrl = derived.rmUrl
+    if (derived.needsHostname) {
+      rmUrl = webappAddressToUrl(derived.rmAddrRaw, await resolveRoleHostname(ctx, hostId))
+    }
+    if (derived.ha) {
+      ctx.warnings.push(
+        `HA 集群：已推导第一个 RM（${derived.rmId || '?'}）的 Web 地址；若指向 standby，请手动把 yarnRmUrl 设为 active RM`,
+      )
+    }
+    const hadRm = ctx.yarn.hasRm
+    const hadJhs = ctx.yarn.hasJhs
+    ctx.yarn.fillDerived(rmUrl, derived.jhsUrl)
+    const notes: string[] = []
+    if (!hadRm && ctx.yarn.hasRm) notes.push(`yarnRmUrl=${rmUrl}`)
+    if (!hadJhs && ctx.yarn.hasJhs) notes.push(`yarnJhsUrl=${derived.jhsUrl}`)
+    if (notes.length > 0) ctx.warnings.push(`YARN 地址未手动配置，已从 CM yarn-site.xml 推导：${notes.join('，')}`)
+  } catch (err) {
+    ctx.warnings.push(`从 CM 自动推导 YARN 地址失败（降级为仅手动配置）：${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** 归一化 CM ApiYarnApplication 行。 */
+function mapCmYarnApp(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    applicationId: str(row.applicationId),
+    name: str(row.name),
+    user: str(row.user),
+    applicationType: str(row.applicationType),
+    state: str(row.state),
+    finalStatus: str(row.finalStatus),
+    startTime: row.startTime ?? null,
+    endTime: row.endTime ?? null,
+    trackingUrl: str(row.trackingUrl),
+  }
+}
+
+async function yarnAction(ctx: Context, action: string, args: Record<string, unknown>): Promise<unknown> {
+  // apps 纯 CM 元数据，无需 RM/JHS；其余动作先把手动留空的地址从 CM 推导补齐。
+  if (action !== 'apps') await resolveYarnTargets(ctx)
+  switch (action) {
+    case 'apps': {
+      const { cluster, service } = await yarnServiceName(ctx, args)
+      const now = Date.now()
+      const from = str(args.from).trim() || new Date(now - 24 * 3_600_000).toISOString()
+      const to = str(args.to).trim() || new Date(now).toISOString()
+      const limit = Math.max(1, Math.min(5000, Math.floor(num(args.limit) ?? 200)))
+      const params: Array<[string, string | number]> = [['from', from], ['to', to], ['limit', limit]]
+      const resp = await ctx.client.get(
+        `/clusters/${encodeURIComponent(cluster)}/services/${encodeURIComponent(service)}/yarnApplications`,
+        params,
+        ctx.signal,
+      )
+      const responseRow = obj(resp)
+      const rawApps = Array.isArray(responseRow.applications) ? responseRow.applications : itemsOf(resp)
+      const cmWarnings = Array.isArray(responseRow.warnings)
+        ? responseRow.warnings.filter((w): w is string => typeof w === 'string')
+        : []
+
+      const user = str(args.user).trim().toLowerCase()
+      const appType = str(args.application_type).trim().toUpperCase()
+      const state = str(args.state).trim().toUpperCase()
+      const finalStatus = str(args.final_status).trim().toUpperCase()
+      const onlyFailed = bool(args.only_failed)
+
+      const apps: Array<Record<string, unknown>> = []
+      for (const item of rawApps) {
+        const row = obj(item)
+        const rowUser = str(row.user).toLowerCase()
+        const rowType = str(row.applicationType).toUpperCase()
+        const rowState = str(row.state).toUpperCase()
+        const rowFinal = str(row.finalStatus).toUpperCase()
+        const failed = rowFinal === 'FAILED' || rowState === 'FAILED'
+        if (user && rowUser !== user) continue
+        if (appType && rowType !== appType) continue
+        if (state && rowState !== state) continue
+        if (finalStatus && rowFinal !== finalStatus) continue
+        if (onlyFailed && !failed) continue
+        apps.push(mapCmYarnApp(row))
+      }
+      const failedCount = apps.filter((a) => str(a.finalStatus).toUpperCase() === 'FAILED' || str(a.state).toUpperCase() === 'FAILED').length
+      ctx.warnings.push(...cmWarnings)
+
+      return {
+        clusterName: cluster,
+        yarnService: service,
+        timeRange: { from, to },
+        totalScanned: rawApps.length,
+        returned: apps.length,
+        failedCount,
+        filters: { user: user || null, applicationType: appType || null, state: state || null, finalStatus: finalStatus || null, onlyFailed },
+        apps,
+        warnings: ctx.warnings,
+        message: `扫描 ${rawApps.length} 个 YARN 应用，过滤后 ${apps.length} 个（失败 ${failedCount} 个）；用 yarn/app 或 yarn/diagnose 深入单个作业`,
+      }
+    }
+
+    case 'app': {
+      const appId = requireStr(args, 'application_id', '如 application_1700000000000_0001')
+      if (ctx.yarn.hasRm) {
+        const app = obj(obj(await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}`, [], ctx.signal)).app)
+        return {
+          source: 'resourcemanager',
+          applicationId: str(app.id, appId),
+          name: str(app.name),
+          user: str(app.user),
+          queue: str(app.queue),
+          applicationType: str(app.applicationType),
+          state: str(app.state),
+          finalStatus: str(app.finalStatus),
+          diagnostics: str(app.diagnostics),
+          trackingUrl: str(app.trackingUrl),
+          amHostHttpAddress: str(app.amHostHttpAddress),
+          amContainerLogs: str(app.amContainerLogs),
+          startedTime: app.startedTime ?? null,
+          finishedTime: app.finishedTime ?? null,
+          elapsedTime: app.elapsedTime ?? null,
+          raw: app,
+        }
+      }
+      const { cluster, service } = await yarnServiceName(ctx, args)
+      const row = obj(
+        await ctx.client.get(
+          `/clusters/${encodeURIComponent(cluster)}/services/${encodeURIComponent(service)}/yarnApplications/${encodeURIComponent(appId)}`,
+          [],
+          ctx.signal,
+        ),
+      )
+      ctx.warnings.push('未能获得 yarnRmUrl（未配置且自动推导失败），已退回 CM 元数据（无 diagnostics 失败摘要）；手动配置 ResourceManager 地址后可取 diagnostics 与 AM 容器位置')
+      return {
+        source: 'cloudera-manager',
+        clusterName: cluster,
+        yarnService: service,
+        ...mapCmYarnApp(row),
+        raw: row,
+        warnings: ctx.warnings,
+      }
+    }
+
+    case 'attempts': {
+      requireRm(ctx)
+      const appId = requireStr(args, 'application_id', '如 application_1700000000000_0001')
+      const raw = await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}/appattempts`, [], ctx.signal)
+      const attempts = rmAppAttempts(raw)
+      return {
+        applicationId: appId,
+        attemptCount: attempts.length,
+        latest: latestAttempt(attempts) ?? null,
+        attempts: attempts.map((a) => ({
+          appAttemptId: str(a.appAttemptId),
+          id: num(a.id) ?? null,
+          containerId: str(a.containerId),
+          nodeId: str(a.nodeId),
+          nodeHttpAddress: str(a.nodeHttpAddress),
+          appAttemptState: str(a.appAttemptState),
+          logsLink: str(a.logsLink),
+          startTime: a.startTime ?? null,
+          finishedTime: a.finishedTime ?? null,
+        })),
+      }
+    }
+
+    case 'logs': {
+      if (!ctx.yarn.hasJhs) {
+        throw new Error(
+          'yarn/logs 需要 JobHistory Server 地址：请在设置 → 插件 → CDH 填 yarnJhsUrl（如 http://jhs:19888，可粘贴 yarn.log.server.url），或确保插件能读到 yarn-site.xml 自动推导；仅支持免 Kerberos（SPNEGO）的 HTTP 端点',
+        )
+      }
+      const appId = requireStr(args, 'application_id', '如 application_1700000000000_0001')
+      const file = str(args.file).trim() || str(args.log_type).trim() || 'stderr'
+      const lines = Math.max(1, Math.min(5000, Math.floor(num(args.lines) ?? 200)))
+      let nodeId = str(args.node).trim()
+      let containerId = str(args.container_id).trim()
+      let user = str(args.user).trim()
+      let entity = str(args.entity).trim()
+
+      // 缺字段时用 RM 补全（默认取最新 attempt 的 AM 容器）。
+      if (!nodeId || !containerId || !user) {
+        if (!ctx.yarn.hasRm) {
+          throw new Error(
+            '缺少 node/container_id/user，且未配置 yarnRmUrl 无法自动定位 AM 容器。请显式传 node/container_id/user，或配置 yarnRmUrl（如 http://rm:8088）',
+          )
+        }
+        const app = obj(obj(await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}`, [], ctx.signal)).app)
+        if (!user) user = str(app.user)
+        const attempts = rmAppAttempts(await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}/appattempts`, [], ctx.signal))
+        const wanted = str(args.attempt_id).trim()
+        const attempt = (wanted ? attempts.find((a) => str(a.appAttemptId) === wanted) : undefined) ?? latestAttempt(attempts)
+        if (attempt) {
+          // 失败态 logsLink 指向 JHS，路径里就有准确的 node/container/entity/user。
+          const parsed = parseAggregatedLogsPath(str(attempt.logsLink))
+          if (parsed) {
+            if (!nodeId) nodeId = parsed.nodeId
+            if (!containerId) containerId = parsed.containerId
+            if (!entity) entity = parsed.entity
+            if (!user) user = parsed.user
+          }
+          if (!nodeId) nodeId = str(attempt.nodeId)
+          if (!containerId) containerId = str(attempt.containerId)
+        }
+      }
+      if (!nodeId || !containerId || !user) {
+        throw new Error(
+          `无法定位容器日志（node="${nodeId}" container="${containerId}" user="${user}"）：作业可能仍在运行（聚合未完成）或 RM 未返回 AM 容器。可显式传 node/container_id/user 重试`,
+        )
+      }
+      if (!entity) entity = containerId
+
+      const html = await ctx.yarn.jhsLogHtml({ nodeId, containerId, entity, user, file, start: -logChunkBytes(lines) }, ctx.signal)
+      const extracted = extractLogText(html)
+      if (extracted.source === 'fallback') {
+        ctx.warnings.push('JHS 未返回 <pre> 日志正文（可能聚合未完成、文件不存在或 ACL 拒绝），已回退为页面文本')
+      }
+      const tail = tailLines(extracted.text, lines)
+      return {
+        applicationId: appId,
+        containerId,
+        nodeId,
+        user,
+        entity,
+        file,
+        source: extracted.source,
+        totalLines: tail.total,
+        returnedLines: tail.lines.length,
+        log: truncate(tail.lines.join('\n'), MAX_TEXT_CHARS),
+        warnings: ctx.warnings,
+      }
+    }
+
+    case 'diagnose': {
+      const appId = requireStr(args, 'application_id', '如 application_1700000000000_0001')
+      const lines = Math.max(1, Math.min(2000, Math.floor(num(args.lines) ?? 200)))
+      const findings: Array<{ check: string; level: string; detail: string }> = []
+      let appInfo: Record<string, unknown> = {}
+      let diagnostics = ''
+      let finalStatus = ''
+      let applicationType = ''
+      let user = ''
+
+      if (ctx.yarn.hasRm) {
+        const app = obj(obj(await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}`, [], ctx.signal)).app)
+        diagnostics = str(app.diagnostics)
+        finalStatus = str(app.finalStatus).toUpperCase()
+        applicationType = str(app.applicationType)
+        user = str(app.user)
+        appInfo = {
+          applicationId: str(app.id, appId),
+          name: str(app.name),
+          user,
+          queue: str(app.queue),
+          applicationType,
+          state: str(app.state),
+          finalStatus: str(app.finalStatus),
+          trackingUrl: str(app.trackingUrl),
+          startedTime: app.startedTime ?? null,
+          finishedTime: app.finishedTime ?? null,
+          elapsedTime: app.elapsedTime ?? null,
+        }
+      } else {
+        const { cluster, service } = await yarnServiceName(ctx, args)
+        const row = obj(
+          await ctx.client.get(
+            `/clusters/${encodeURIComponent(cluster)}/services/${encodeURIComponent(service)}/yarnApplications/${encodeURIComponent(appId)}`,
+            [],
+            ctx.signal,
+          ),
+        )
+        finalStatus = str(row.finalStatus).toUpperCase()
+        applicationType = str(row.applicationType)
+        user = str(row.user)
+        appInfo = { ...mapCmYarnApp(row), applicationId: str(row.applicationId, appId) }
+        ctx.warnings.push('未能获得 yarnRmUrl（未配置且自动推导失败）：diagnostics 失败摘要不可用，已退回 CM 元数据')
+      }
+
+      if (finalStatus === 'FAILED') {
+        findings.push({ check: 'APP_FAILED', level: 'BAD', detail: '作业最终状态 FAILED' })
+      } else if (finalStatus === 'KILLED') {
+        findings.push({ check: 'APP_KILLED', level: 'CONCERNING', detail: '作业被 KILLED（可能人为终止、超时或资源抢占）' })
+      }
+      if (diagnostics) findings.push({ check: 'DIAGNOSTICS', level: 'CONCERNING', detail: truncate(diagnostics, 2000) })
+
+      let amContainer: Record<string, unknown> | null = null
+      let logTail = ''
+      let errorLines: string[] = []
+      if (ctx.yarn.hasRm && ctx.yarn.hasJhs) {
+        try {
+          const attempts = rmAppAttempts(await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}/appattempts`, [], ctx.signal))
+          const attempt = latestAttempt(attempts)
+          if (attempt) {
+            const parsed = parseAggregatedLogsPath(str(attempt.logsLink))
+            const nodeId = parsed?.nodeId || str(attempt.nodeId)
+            const containerId = parsed?.containerId || str(attempt.containerId)
+            const entity = parsed?.entity || containerId
+            const owner = parsed?.user || user
+            amContainer = {
+              appAttemptId: str(attempt.appAttemptId),
+              containerId,
+              nodeId,
+              nodeHttpAddress: str(attempt.nodeHttpAddress),
+              appAttemptState: str(attempt.appAttemptState),
+            }
+            if (nodeId && containerId && owner) {
+              const file = str(args.file).trim() || 'stderr'
+              const html = await ctx.yarn.jhsLogHtml({ nodeId, containerId, entity, user: owner, file, start: -logChunkBytes(lines) }, ctx.signal)
+              const extracted = extractLogText(html)
+              if (extracted.source === 'fallback') ctx.warnings.push('JHS 未返回日志正文（聚合可能未完成），已回退为页面文本')
+              const tail = tailLines(extracted.text, lines)
+              logTail = truncate(tail.lines.join('\n'), MAX_TEXT_CHARS)
+              errorLines = extractErrorLines(extracted.text)
+              if (errorLines.length > 0) {
+                findings.push({ check: 'AM_LOG_ERRORS', level: 'BAD', detail: `AM 容器日志含 ${errorLines.length} 行异常/错误关键行（见 errorLines）` })
+              }
+            }
+          }
+        } catch (err) {
+          ctx.warnings.push(`AM 容器日志取证失败（降级，不拖垮整体）：${err instanceof Error ? err.message : String(err)}`)
+        }
+      } else {
+        if (!ctx.yarn.hasRm) ctx.warnings.push('未能获得 yarnRmUrl（未配置且自动推导失败）：无法定位 AM 容器')
+        if (!ctx.yarn.hasJhs) ctx.warnings.push('未能获得 yarnJhsUrl（未配置且自动推导失败）：无法取容器日志正文')
+      }
+
+      const overall: Severity = findings.some((f) => f.level === 'BAD')
+        ? 'BAD'
+        : findings.some((f) => f.level === 'CONCERNING')
+          ? 'CONCERNING'
+          : 'GOOD'
+      return {
+        applicationId: appId,
+        overallHealth: overall,
+        app: appInfo,
+        diagnostics: diagnostics || null,
+        amContainer,
+        errorLines,
+        logTail,
+        findings,
+        warnings: ctx.warnings,
+        message: `YARN 作业 ${appId}（${applicationType || '未知类型'}）诊断完成，最终状态 ${finalStatus || '未知'}，整体 ${overall}`,
+      }
+    }
+
+    default:
+      throw new Error(`yarn 不支持 action=${action}`)
+  }
+}
+
 /* ── 分发器 ─────────────────────────────────────────────────────────────── */
 
 /**
@@ -1204,6 +1616,7 @@ export function createDispatcher(
 
     const ctx: Context = {
       client: new CmClient(snapshot),
+      yarn: new YarnClient(snapshot),
       settings: snapshot,
       signal,
       warnings: [],
@@ -1227,6 +1640,8 @@ export function createDispatcher(
           return await metricsAction(ctx, action, args)
         case 'diagnosis':
           return await diagnosisAction(ctx, action, args)
+        case 'yarn':
+          return await yarnAction(ctx, action, args)
         default:
           throw new Error(`未知分类 "${category}"`)
       }

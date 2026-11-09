@@ -338,3 +338,196 @@ export function buildEventQuery(args: Record<string, unknown>): {
     endTime: endRaw,
   }
 }
+
+/* ── YARN 作业日志（纯函数，便于离线单测） ─────────────────────────────── */
+
+function safeCodePoint(code: number): string {
+  if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return ''
+  try {
+    return String.fromCodePoint(code)
+  } catch {
+    return ''
+  }
+}
+
+/** HTML 实体反转义（JHS 把日志正文转义后塞进 <pre>）；单遍替换避免二次反转义。 */
+export function unescapeHtml(text: string): string {
+  return text.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (match, entity: string) => {
+    const lower = entity.toLowerCase()
+    if (lower.startsWith('#x')) return safeCodePoint(parseInt(entity.slice(2), 16))
+    if (lower.startsWith('#')) return safeCodePoint(parseInt(entity.slice(1), 10))
+    switch (lower) {
+      case 'amp':
+        return '&'
+      case 'lt':
+        return '<'
+      case 'gt':
+        return '>'
+      case 'quot':
+        return '"'
+      case 'apos':
+        return "'"
+      default:
+        return match
+    }
+  })
+}
+
+function stripTags(text: string): string {
+  return text.replace(/<[^>]*>/g, '')
+}
+
+/**
+ * 从 JHS 聚合日志 HTML 提取纯文本：优先取 <pre> 里的日志正文；
+ * 没有 <pre> 时退化为去标签全文（保留 "Aggregation is not enabled" / "Logs not available" 等错误提示）。
+ */
+export function extractLogText(html: string): { text: string; source: 'pre' | 'fallback' } {
+  const pres: string[] = []
+  const re = /<pre\b[^>]*>([\s\S]*?)<\/pre>/gi
+  let match: RegExpExecArray | null
+  while ((match = re.exec(html)) !== null) {
+    pres.push(unescapeHtml(stripTags(match[1] ?? '')).replace(/\s+$/, ''))
+  }
+  if (pres.length > 0) return { text: pres.join('\n'), source: 'pre' }
+
+  const body = html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '')
+  const text = unescapeHtml(stripTags(body)).replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim()
+  return { text, source: 'fallback' }
+}
+
+/** 从日志文本挑出异常/错误关键行（Java 栈的 Caused by / Exception / ERROR / FATAL），供失败摘要。 */
+export function extractErrorLines(text: string, maxLines = 40): string[] {
+  const out: string[] = []
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line) continue
+    if (/(?:\bException\b|\bCaused by:|\bERROR\b|\bFATAL\b|OutOfMemoryError)/.test(line)) {
+      out.push(line.length > 500 ? `${line.slice(0, 500)}…` : line)
+      if (out.length >= maxLines) break
+    }
+  }
+  return out
+}
+
+/** 从 RM `/apps/{id}/appattempts` 响应提取 attempt 数组（`{appAttempts:{appAttempt:[...]}}`，单对象也兼容）。 */
+export function rmAppAttempts(raw: unknown): Array<Record<string, unknown>> {
+  const inner = obj(obj(raw).appAttempts).appAttempt
+  if (Array.isArray(inner)) return inner.map((item) => obj(item))
+  if (inner && typeof inner === 'object') return [obj(inner)]
+  return []
+}
+
+/** 取最新一次 attempt（id 最大）；空数组返回 undefined。 */
+export function latestAttempt(attempts: Array<Record<string, unknown>>): Record<string, unknown> | undefined {
+  let best: Record<string, unknown> | undefined
+  let bestId = -1
+  for (const attempt of attempts) {
+    const id = num(attempt.id) ?? 0
+    if (best === undefined || id >= bestId) {
+      best = attempt
+      bestId = id
+    }
+  }
+  return best
+}
+
+/**
+ * 解析 RM logsLink（失败态指向 JHS）路径里的 node/container/entity/user；
+ * 非 JHS 链接（如运行态的 NM containerlogs）返回 undefined。
+ */
+export function parseAggregatedLogsPath(
+  logsLink: string,
+): { nodeId: string; containerId: string; entity: string; user: string } | undefined {
+  let url: URL
+  try {
+    url = new URL(logsLink)
+  } catch {
+    return undefined
+  }
+  const marker = '/jobhistory/logs/'
+  const index = url.pathname.indexOf(marker)
+  if (index < 0) return undefined
+  const decode = (segment: string): string => {
+    try {
+      return decodeURIComponent(segment)
+    } catch {
+      return segment
+    }
+  }
+  const segments = url.pathname.slice(index + marker.length).split('/').filter(Boolean).map(decode)
+  if (segments.length < 4) return undefined
+  return { nodeId: segments[0]!, containerId: segments[1]!, entity: segments[2]!, user: segments[3]! }
+}
+
+/* ── 从 CM 下发的 yarn-site.xml 推导 YARN Web 地址（纯函数，便于离线单测） ── */
+
+/**
+ * 解析 Hadoop 配置 XML（`<property><name>…</name><value>…</value></property>`）为键值表。
+ * CM 生成的部署配置是机器排版、无注释样例，定向正则足够；值里的 XML 实体复用 unescapeHtml。
+ */
+export function parseHadoopConfigXml(xml: string): Map<string, string> {
+  const props = new Map<string, string>()
+  const blockRe = /<property\b[^>]*>([\s\S]*?)<\/property>/gi
+  let match: RegExpExecArray | null
+  while ((match = blockRe.exec(xml)) !== null) {
+    const block = match[1] ?? ''
+    const name = /<name\b[^>]*>([\s\S]*?)<\/name>/i.exec(block)?.[1]
+    if (name === undefined) continue
+    const value = /<value\b[^>]*>([\s\S]*?)<\/value>/i.exec(block)?.[1] ?? ''
+    props.set(unescapeHtml(name.trim()), unescapeHtml(value.trim()))
+  }
+  return props
+}
+
+/**
+ * 把 `yarn.resourcemanager.webapp.address` 的 `host:port` 归一为 http URL。
+ * 绑定地址（0.0.0.0 / * / localhost / 127.0.0.1 / 空 host）用传入的角色主机名替换；
+ * 缺主机名时返回空串（调用方据此决定是否去 CM 解析角色主机）。
+ */
+export function webappAddressToUrl(addr: string, roleHostname = ''): string {
+  const trimmed = addr.trim()
+  if (!trimmed) return ''
+  const idx = trimmed.lastIndexOf(':')
+  const host = idx >= 0 ? trimmed.slice(0, idx) : trimmed
+  const port = idx >= 0 ? trimmed.slice(idx + 1) : ''
+  const bindAll = host === '' || ['0.0.0.0', '*', 'localhost', '127.0.0.1'].includes(host.toLowerCase())
+  const finalHost = bindAll ? roleHostname.trim() : host
+  if (!finalHost) return ''
+  return port ? `http://${finalHost}:${port}` : `http://${finalHost}`
+}
+
+/** deriveYarnUrlsFromProps 的结果：rmUrl 可能因绑定地址待替换而为空（见 needsHostname）。 */
+export interface DerivedYarnUrls {
+  rmUrl: string
+  jhsUrl: string
+  ha: boolean
+  /** HA 时选中的第一个 rm-id（非 HA 为空）。 */
+  rmId: string
+  /** 原始 webapp address，供需要时替换绑定主机。 */
+  rmAddrRaw: string
+  /** rmAddr 非空但含绑定主机，需角色主机名替换后才能成 URL。 */
+  needsHostname: boolean
+}
+
+/**
+ * 从 yarn-site.xml 键值表推导 RM / JHS 地址：
+ * - JHS 取 `yarn.log.server.url`（已是完整 URL，路径由 YarnClient.normalizeOrigin 剥离）；
+ * - RM 非 HA 取 `yarn.resourcemanager.webapp.address`，HA 取第一个 rm-id 的
+ *   `yarn.resourcemanager.webapp.address.<id>`（active 与否需运行时判断，调用方提示手动覆盖）。
+ */
+export function deriveYarnUrlsFromProps(props: Map<string, string>): DerivedYarnUrls {
+  const jhsUrl = (props.get('yarn.log.server.url') ?? '').trim()
+  const ha = (props.get('yarn.resourcemanager.ha.enabled') ?? '').trim().toLowerCase() === 'true'
+  let rmId = ''
+  let rmAddrRaw = ''
+  if (ha) {
+    rmId = (props.get('yarn.resourcemanager.ha.rm-ids') ?? '').split(',').map((s) => s.trim()).filter(Boolean)[0] ?? ''
+    if (rmId) rmAddrRaw = (props.get(`yarn.resourcemanager.webapp.address.${rmId}`) ?? '').trim()
+  } else {
+    rmAddrRaw = (props.get('yarn.resourcemanager.webapp.address') ?? '').trim()
+  }
+  const rmUrl = webappAddressToUrl(rmAddrRaw)
+  return { rmUrl, jhsUrl, ha, rmId, rmAddrRaw, needsHostname: rmAddrRaw.length > 0 && rmUrl.length === 0 }
+}

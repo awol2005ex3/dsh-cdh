@@ -28,12 +28,16 @@ export function createCdhTool(dispatch: Dispatch) {
       '{category:"role",action:"logs",args:{service_name:"hdfs1",role_name:"hdfs-DATANODE-xxx",log_type:"stderr",lines:200}};',
       '{category:"events",action:"alerts",args:{hours:24,severities:["CRITICAL","ERROR"]}};',
       '{category:"metrics",action:"list",args:{filter:"dfs_",context:"SERVICE"}} 先查指标名再 query；',
-      '{category:"diagnosis",action:"hdfs"} / "yarn" / "impala" 专项诊断。',
+      '{category:"diagnosis",action:"hdfs"} / "yarn" / "impala" 专项诊断（diagnosis/yarn 是 YARN 服务级健康，不是作业日志）。',
+      '{category:"yarn",action:"apps",args:{only_failed:true,application_type:"SPARK"}} 找失败的 Spark/Flink/Hive on YARN 作业（走 CM，无需额外配置）；',
+      '{category:"yarn",action:"diagnose",args:{application_id:"application_xxx"}} 单作业失败诊断（diagnostics + AM 容器日志摘要）；',
+      '{category:"yarn",action:"logs",args:{application_id:"application_xxx",file:"stderr",lines:300}} 取容器日志正文（yarnRmUrl/yarnJhsUrl 手动配置优先，留空自动从 CM 推导）。',
       '写 metrics/query 的 tsquery 前先加载 skill "cdh-tsquery"（CM tsquery 语法、与 events/query 的区别、指标名核对）；',
       '按故障现象加载排查 skill（各含 cdh 取证序列 + 需运维在主机补执行的命令）：',
       'CPU/load/iowait → "cdh-host-cpu"；内存/swap/主机 OOM 前兆 → "cdh-host-memory"；',
       '磁盘 IO/容量/掉盘 → "cdh-disk-io"；进程无故消失/时钟/fd/内核参数 → "cdh-linux-kernel"；',
-      'Java OOME/GC 停顿/角色重启 → "cdh-jvm-oom"。',
+      'Java OOME/GC 停顿/角色重启 → "cdh-jvm-oom"；',
+      'Spark/Flink/Hive on YARN 作业失败、取容器或作业日志 → "cdh-yarn-jobs"。',
       'cluster_name 省略时用插件默认集群，其次取 CM 上的第一个集群。',
     ].join(' '),
     parameters: {
@@ -52,7 +56,8 @@ export function createCdhTool(dispatch: Dispatch) {
         additionalProperties: true,
         description:
           '操作参数：cluster_name / service_name / role_name / host_id / file_name / log_type / lines / ' +
-          'tsquery / filter / hours / severities / query / from / to / limit / command_id 等，按 action 选取。',
+          'tsquery / filter / hours / severities / query / from / to / limit / command_id / ' +
+          'application_id / application_type / user / only_failed / final_status / node / container_id / entity / file / attempt_id 等，按 action 选取。',
       },
     },
     output: {

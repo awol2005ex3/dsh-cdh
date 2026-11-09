@@ -8,12 +8,12 @@ DeepSeek Harness (dsh) 插件：**只读**诊断 Cloudera Manager / CDH 集群�
 - 只读：仅调用 CM REST API 的查询类接口，不执行任何会改集群状态的命令，**也不能登录主机执行命令**。
 - 零第三方运行时依赖：HTTP 走 Node 内置 `fetch`（Node ≥ 22.14.0）。
 - 配置热改即生效：全部字段 `volatile`，每个请求现读快照，改完无需重启。
-- 内置 6 个排查 skill：模型按故障现象按需加载，每张卡给出「cdh 工具取证序列 + 判读要点 +
+- 内置 7 个排查 skill：模型按故障现象按需加载，每张卡给出「cdh 工具取证序列 + 判读要点 +
   需运维在主机补执行的命令清单」（`skills/*.md`），见下表。
 
 ## 功能
 
-一个 `cdh(category, action, args)` 工具收拢 8 个诊断分类（工具面越小，模型选错工具的概率越低）：
+一个 `cdh(category, action, args)` 工具收拢 9 个诊断分类（工具面越小，模型选错工具的概率越低）：
 
 | 分类 | action | 说明 |
 | --- | --- | --- |
@@ -25,13 +25,20 @@ DeepSeek Harness (dsh) 插件：**只读**诊断 Cloudera Manager / CDH 集群�
 | `events` | `query` / `alerts` / `build_query` | 事件查询语法、近 N 小时告警 |
 | `metrics` | `query` / `list` / `service` / `host` | 时序指标检索与查询 |
 | `diagnosis` | `overview` / `hdfs` / `yarn` / `impala` / `command_status` / `command_logs` | 集群评分与专项诊断 |
+| `yarn` | `apps` / `app` / `attempts` / `logs` / `diagnose` | Spark/Flink/Hive on YARN 作业失败诊断与容器日志取证 |
 
 `diagnosis/overview` 汇总服务、主机、告警三方面给出 0–100 健康评分与处理建议；
 `hdfs` / `yarn` / `impala` 为专项诊断（容量、副本、资源争抢、失败 SQL 聚合等）。
 
+`yarn` 分类面向**作业级**取证（区别于 `diagnosis/yarn` 的服务级健康）：`apps` 走 CM `yarnApplications`
+找失败作业（无需额外配置）；`app`/`attempts`/`logs`/`diagnose` 经 ResourceManager REST 取 `diagnostics`
+与 AM 容器位置、经 JobHistory Server 取聚合容器日志正文。`yarnRmUrl`/`yarnJhsUrl` 手动配置优先，
+留空时自动从 CM 下发的 `yarn-site.xml` 推导（`yarn.resourcemanager.webapp.address` / `yarn.log.server.url`，
+处理 `0.0.0.0` 绑定地址与 HA）；仅支持免 Kerberos 的 HTTP 端点。详见 skill `cdh-yarn-jobs`。
+
 ### 内置排查 skills
 
-CDH 故障里大量涉及 CPU / 内存 / IO / Linux 内核 / Java 进程 OOM 的排查。插件把运维知识拆成
+CDH 故障里大量涉及 CPU / 内存 / IO / Linux 内核 / Java 进程 OOM / YARN 作业失败的排查。插件把运维知识拆成
 按「故障现象」切分的 runtime skills，模型命中一张卡即可拿到完整取证序列，不必每次重推一遍：
 
 | Skill | 触发现象 | 正文 |
@@ -42,6 +49,7 @@ CDH 故障里大量涉及 CPU / 内存 / IO / Linux 内核 / Java 进程 OOM 的
 | `cdh-disk-io` | IO 延迟 / 磁盘将满 / DataNode 掉盘 / HDFS 变慢 | [skills/cdh-disk-io.md](skills/cdh-disk-io.md) |
 | `cdh-linux-kernel` | 进程无故消失 / 时钟偏移 / fd 耗尽 / 内核参数核对 | [skills/cdh-linux-kernel.md](skills/cdh-linux-kernel.md) |
 | `cdh-jvm-oom` | `OutOfMemoryError` / GC 停顿 / 角色僵死或重启 | [skills/cdh-jvm-oom.md](skills/cdh-jvm-oom.md) |
+| `cdh-yarn-jobs` | Spark/Flink/Hive on YARN 作业失败 / 取容器或作业日志 | [skills/cdh-yarn-jobs.md](skills/cdh-yarn-jobs.md) |
 
 设计要点：
 
@@ -91,6 +99,8 @@ CDH 故障里大量涉及 CPU / 内存 / IO / Linux 内核 / Java 进程 OOM 的
 | `apiVersion` | `v41` | CM REST API 版本（CM 7.1.x / CDH 7.1.7；CM 6.x 常用 `v31`/`v40`） |
 | `timeoutMs` | `30000` | 单次 CM 请求超时 |
 | `defaultCluster` | 空 | 工具省略 `cluster_name` 时使用；留空自动取第一个集群 |
+| `yarnRmUrl` | 空 | ResourceManager Web 基址（`http://rm:8088`）：取作业 diagnostics 与 AM 容器位置；留空自动从 CM `yarn-site.xml` 推导，推导失败才退回 CM 元数据 |
+| `yarnJhsUrl` | 空 | JobHistory Server 基址（`http://jhs:19888`，可粘贴 `yarn.log.server.url`）：取聚合容器日志正文；留空自动从 CM `yarn-site.xml` 推导 |
 
 ## 开发
 
@@ -113,14 +123,15 @@ npm run check        # 全部冒烟（= npm test）
 src/
   index.ts      宿主半插件入口（路由 + 工具注册）
   settings.ts   Config schema（volatile 配置）与现读快照
-  service.ts    诊断业务层与分发器（8 分类动作表）
+  service.ts    诊断业务层与分发器（9 分类动作表）
   rpc.ts        /api/cdh/* 精确路由与 RPC 信封
   tool.ts       cdh agent 工具定义
   cm-client.ts  Cloudera Manager REST 客户端
-  analysis.ts   健康度/指标/事件查询等公共逻辑
+  yarn-client.ts  YARN Web 只读客户端（ResourceManager REST + JobHistory 聚合日志）
+  analysis.ts   健康度/指标/事件查询/YARN 日志提取等公共逻辑
   skill.ts      内置 skills 的注册清单（BUILTIN_SKILLS）与装配
   client.ts     浏览器半设置面板（bundle 模块体）
-skills/         内置 skill 正文（6 个 *.md，随发布物打包）
+skills/         内置 skill 正文（7 个 *.md，随发布物打包）
 scripts/        构建包装与三个冒烟脚本
 ```
 

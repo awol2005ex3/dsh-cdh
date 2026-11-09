@@ -41,7 +41,7 @@ function resolveTarget(settings: CdhSettings): ResolvedTarget {
 }
 
 /** 把外部 signal 与超时合并成一个 AbortSignal。 */
-function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; cancel: () => void } {
+export function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; cancel: () => void } {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new Error(`请求超时（${timeoutMs}ms）`)), timeoutMs)
   const onAbort = () => controller.abort(signal?.reason)
@@ -58,7 +58,7 @@ function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): { sign
   }
 }
 
-function abortedMessage(signal: AbortSignal | undefined, error: unknown): string {
+export function abortedMessage(signal: AbortSignal | undefined, error: unknown): string {
   if (signal?.aborted) return '请求已取消'
   const reason = (error as { cause?: unknown })?.cause
   return reason instanceof Error ? reason.message : error instanceof Error ? error.message : String(error)

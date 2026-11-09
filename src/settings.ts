@@ -35,6 +35,10 @@ export interface CdhSettings {
   timeoutMs: number
   /** 默认集群名；留空时自动取 CM 上的第一个集群 */
   defaultCluster: string
+  /** YARN ResourceManager Web 基址（如 http://rm.example.com:8088）；留空则 yarn 分类退回 CM 元数据 */
+  yarnRmUrl: string
+  /** YARN JobHistory Server Web 基址（如 http://jhs.example.com:19888）；留空则取不了容器日志正文 */
+  yarnJhsUrl: string
 }
 
 /** `Config` schema 的解析结果：每个字段都可能是 volatile 引用。 */
@@ -47,6 +51,8 @@ export interface CdhConfig {
   apiVersion?: MaybeVolatile<string>
   timeoutMs?: MaybeVolatile<number>
   defaultCluster?: MaybeVolatile<string>
+  yarnRmUrl?: MaybeVolatile<string>
+  yarnJhsUrl?: MaybeVolatile<string>
 }
 
 /** 与 Schema 默认值保持一致的常量兜底。 */
@@ -59,6 +65,8 @@ const DEFAULTS = {
   apiVersion: 'v41',
   timeoutMs: 30_000,
   defaultCluster: '',
+  yarnRmUrl: '',
+  yarnJhsUrl: '',
 }
 
 /**
@@ -84,6 +92,14 @@ export const CdhConfigSchema = z.object({
   timeoutMs: z.number().default(DEFAULTS.timeoutMs).volatile().description('单次 CM 请求超时（毫秒），默认 30000'),
   defaultCluster: z.string().default(DEFAULTS.defaultCluster).volatile().description(
     '默认集群名：工具省略 cluster_name 时使用；留空自动取 CM 上的第一个集群',
+  ),
+  yarnRmUrl: z.string().default(DEFAULTS.yarnRmUrl).volatile().description(
+    'YARN ResourceManager Web 基址（如 http://rm.example.com:8088）：取作业 diagnostics 失败摘要与 AM 容器位置。' +
+      '留空时自动从 CM 的 yarn-site.xml（yarn.resourcemanager.webapp.address）推导，推导失败才退回 CM 元数据。仅支持免 Kerberos（SPNEGO）的 HTTP 端点',
+  ),
+  yarnJhsUrl: z.string().default(DEFAULTS.yarnJhsUrl).volatile().description(
+    'YARN JobHistory Server Web 基址（如 http://jhs.example.com:19888，可直接粘贴 yarn.log.server.url，会自动忽略路径部分）：' +
+      '取聚合容器日志正文（Spark driver / Flink JobManager / MR·Tez AM）。留空时自动从 CM 的 yarn-site.xml（yarn.log.server.url）推导，推导失败则 yarn/logs 不可用',
   ),
 })
 
@@ -124,5 +140,7 @@ export function readCdhSettings(config?: CdhConfig | null): CdhSettings {
     apiVersion: apiVersionRaw.startsWith('v') ? apiVersionRaw : `v${apiVersionRaw}`,
     timeoutMs: clamp(unwrap(source.timeoutMs), 1000, 600_000, DEFAULTS.timeoutMs),
     defaultCluster: text(unwrap(source.defaultCluster), DEFAULTS.defaultCluster),
+    yarnRmUrl: text(unwrap(source.yarnRmUrl), DEFAULTS.yarnRmUrl),
+    yarnJhsUrl: text(unwrap(source.yarnJhsUrl), DEFAULTS.yarnJhsUrl),
   }
 }

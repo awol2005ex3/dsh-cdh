@@ -100,6 +100,8 @@ interface CdhFormValue {
   apiVersion: string
   timeoutMs: number
   defaultCluster: string
+  yarnRmUrl: string
+  yarnJhsUrl: string
 }
 
 interface SettingsChannel {
@@ -174,6 +176,8 @@ function configFormsChannel(ctx: any): SettingsChannel | undefined {
         apiVersion: typeof value.apiVersion === 'string' ? value.apiVersion : undefined,
         timeoutMs: typeof value.timeoutMs === 'number' ? value.timeoutMs : undefined,
         defaultCluster: typeof value.defaultCluster === 'string' ? value.defaultCluster : undefined,
+        yarnRmUrl: typeof value.yarnRmUrl === 'string' ? value.yarnRmUrl : undefined,
+        yarnJhsUrl: typeof value.yarnJhsUrl === 'string' ? value.yarnJhsUrl : undefined,
       }
     },
     write: async (patch) => {
@@ -199,6 +203,8 @@ function rpcSettingsChannel(conn: any): SettingsChannel | undefined {
         apiVersion: typeof value.apiVersion === 'string' ? value.apiVersion : undefined,
         timeoutMs: typeof value.timeoutMs === 'number' ? value.timeoutMs : undefined,
         defaultCluster: typeof value.defaultCluster === 'string' ? value.defaultCluster : undefined,
+        yarnRmUrl: typeof value.yarnRmUrl === 'string' ? value.yarnRmUrl : undefined,
+        yarnJhsUrl: typeof value.yarnJhsUrl === 'string' ? value.yarnJhsUrl : undefined,
         hasPassword: value.hasPassword === true,
       }
     },
@@ -290,6 +296,8 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
   const apiVersionInput = el('input', { placeholder: 'v41', style: INPUT_CSS }) as HTMLInputElement
   const timeoutInput = el('input', { type: 'number', placeholder: '30000', style: INPUT_CSS }) as HTMLInputElement
   const clusterInput = el('input', { placeholder: '留空自动取第一个集群', style: INPUT_CSS }) as HTMLInputElement
+  const rmUrlInput = el('input', { placeholder: 'http://rm.example.com:8088（可选）', style: INPUT_CSS }) as HTMLInputElement
+  const jhsUrlInput = el('input', { placeholder: 'http://jhs.example.com:19888（可选）', style: INPUT_CSS }) as HTMLInputElement
 
   const status = el('div', { style: HINT_CSS })
   const output = el('pre', { style: PRE_CSS })
@@ -323,6 +331,8 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
       if (typeof value.apiVersion === 'string') apiVersionInput.value = value.apiVersion
       if (typeof value.timeoutMs === 'number') timeoutInput.value = String(value.timeoutMs)
       if (typeof value.defaultCluster === 'string') clusterInput.value = value.defaultCluster
+      if (typeof value.yarnRmUrl === 'string') rmUrlInput.value = value.yarnRmUrl
+      if (typeof value.yarnJhsUrl === 'string') jhsUrlInput.value = value.yarnJhsUrl
       hasPassword = value.hasPassword === true || (typeof value.password === 'string' && value.password.length > 0)
       passwordInput.value = ''
       passwordInput.placeholder = hasPassword
@@ -345,6 +355,8 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
     const timeout = Number.parseInt(timeoutInput.value, 10)
     patch.timeoutMs = Number.isFinite(timeout) && timeout >= 1000 ? timeout : 30000
     patch.defaultCluster = clusterInput.value.trim()
+    patch.yarnRmUrl = rmUrlInput.value.trim()
+    patch.yarnJhsUrl = jhsUrlInput.value.trim()
     // 密码留空 = 不修改，避免每次保存都把已存密码清空。
     if (includePassword && passwordInput.value.length > 0) patch.password = passwordInput.value
     return patch
@@ -436,6 +448,8 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
     field('API 版本', apiVersionInput, '默认 v41（CM 7.1.x / CDH 7.1.7）；CM 6.x 常用 v31/v40'),
     field('超时(ms)', timeoutInput, '单次 CM 请求超时，默认 30000'),
     field('默认集群', clusterInput, '工具省略 cluster_name 时使用；留空取第一个集群'),
+    field('YARN RM 地址', rmUrlInput, '可选，留空自动从 CM yarn-site.xml 推导。ResourceManager Web 基址，取作业 diagnostics 与 AM 容器位置；仅支持免 Kerberos 的 HTTP'),
+    field('YARN JHS 地址', jhsUrlInput, '可选，留空自动从 CM yarn-site.xml 推导。JobHistory Server 基址（可粘贴 yarn.log.server.url），取 Spark/Flink/Hive 容器日志正文'),
     el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [saveBtn, testBtn, clusterBtn, overviewBtn]),
     status,
     output,

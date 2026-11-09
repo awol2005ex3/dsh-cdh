@@ -108,6 +108,7 @@ const EXPECTED_SKILLS = [
   'cdh-disk-io',
   'cdh-linux-kernel',
   'cdh-jvm-oom',
+  'cdh-yarn-jobs',
 ]
 assert.deepEqual(skills.map((s) => s.name).sort(), [...EXPECTED_SKILLS].sort(), '所有内置 skill 都应注册')
 for (const skill of skills) {
@@ -126,6 +127,8 @@ assert.match(byName['cdh-host-memory'], /OOM killer/)
 assert.match(byName['cdh-disk-io'], /diagnosis\/hdfs/)
 assert.match(byName['cdh-linux-kernel'], /dmesg/)
 assert.match(byName['cdh-jvm-oom'], /OutOfMemoryError/)
+assert.match(byName['cdh-yarn-jobs'], /yarn\/logs/)
+assert.match(byName['cdh-yarn-jobs'], /diagnostics/)
 
 // 工具描述应把所有排查 skill 都点名（模型才知道何时加载）
 for (const name of EXPECTED_SKILLS) {

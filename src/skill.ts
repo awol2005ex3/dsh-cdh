@@ -88,6 +88,15 @@ export const BUILTIN_SKILLS: readonly BuiltinSkillDef[] = [
       '以及 jcmd/jstat/jmap/jstack/GC 日志主机侧命令与各角色（NameNode/Impala/HBase 等）着眼点。',
     file: 'cdh-jvm-oom.md',
   },
+  {
+    name: 'cdh-yarn-jobs',
+    description:
+      '排查 Spark on YARN / Flink on YARN / Hive on YARN（MR·Tez）作业失败、需要取容器或作业日志时加载。' +
+      '给出 yarn/apps 找失败作业 → yarn/app 取 diagnostics → yarn/attempts 定位 AM 容器 → yarn/logs 取聚合日志的固定序列，' +
+      '按引擎区分该读哪个日志文件（driver stderr / jobmanager.log / AM syslog），说明 yarnRmUrl/yarnJhsUrl 配置与免 Kerberos 限制、' +
+      '聚合未完成/ACL 拒绝的降级，以及需运维补执行的 yarn logs / HDFS 命令。',
+    file: 'cdh-yarn-jobs.md',
+  },
 ]
 
 /** `ctx.skills.register()` 的最小鸭子类型（不引入 @deepseek-ai/dsh-skill 运行时依赖）。 */
