@@ -99,6 +99,8 @@ for (const [path, route] of routes) {
 assert.equal(tools.length, 1)
 assert.equal(tools[0].name, 'cdh')
 assert.match(tools[0].description, /cdh-tsquery/, '工具描述应提示先加载 tsquery skill')
+assert.match(tools[0].description, /flink_logs/, '工具描述应点名 Flink 引擎日志动作')
+assert.match(tools[0].description, /spark_logs/, '工具描述应点名 Spark 引擎日志动作')
 
 // 内置 skills：全部注册、来源/调用策略/正文来自 md 且非空
 const EXPECTED_SKILLS = [
@@ -178,6 +180,7 @@ const settingsResponse = await routes
 const settingsBody = JSON.stringify((await settingsResponse.json()).result)
 assert.ok(!settingsBody.includes('secret'), 'settings 回包不得包含密码明文')
 assert.ok(settingsBody.includes('"hasPassword":true'), 'settings 应回报 hasPassword')
+assert.ok(settingsBody.includes('"sparkHistoryUrl"'), 'settings 应包含非敏感的 sparkHistoryUrl')
 
 // 未知分类 → 业务错误分支（不抛 500）
 const badCategory = await routes

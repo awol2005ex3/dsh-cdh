@@ -39,6 +39,8 @@ export interface CdhSettings {
   yarnRmUrl: string
   /** YARN JobHistory Server Web 基址（如 http://jhs.example.com:19888）；留空则取不了容器日志正文 */
   yarnJhsUrl: string
+  /** Spark History Server Web 基址（如 http://shs.example.com:18080）；留空则取不了已完成 Spark 作业的 executor 日志 */
+  sparkHistoryUrl: string
 }
 
 /** `Config` schema 的解析结果：每个字段都可能是 volatile 引用。 */
@@ -53,6 +55,7 @@ export interface CdhConfig {
   defaultCluster?: MaybeVolatile<string>
   yarnRmUrl?: MaybeVolatile<string>
   yarnJhsUrl?: MaybeVolatile<string>
+  sparkHistoryUrl?: MaybeVolatile<string>
 }
 
 /** 与 Schema 默认值保持一致的常量兜底。 */
@@ -67,6 +70,7 @@ const DEFAULTS = {
   defaultCluster: '',
   yarnRmUrl: '',
   yarnJhsUrl: '',
+  sparkHistoryUrl: '',
 }
 
 /**
@@ -100,6 +104,10 @@ export const CdhConfigSchema = z.object({
   yarnJhsUrl: z.string().default(DEFAULTS.yarnJhsUrl).volatile().description(
     'YARN JobHistory Server Web 基址（如 http://jhs.example.com:19888，可直接粘贴 yarn.log.server.url，会自动忽略路径部分）：' +
       '取聚合容器日志正文（Spark driver / Flink JobManager / MR·Tez AM）。留空时自动从 CM 的 yarn-site.xml（yarn.log.server.url）推导，推导失败则 yarn/logs 不可用',
+  ),
+  sparkHistoryUrl: z.string().default(DEFAULTS.sparkHistoryUrl).volatile().description(
+    'Spark History Server Web 基址（如 http://shs.example.com:18080）：取已完成/失败 Spark 作业的 executor 日志 URL（yarn/spark_logs）。' +
+      '留空时自动从 CM 的 Spark 服务角色 Web UI 地址（roleUrl）推导；运行中作业无需它（走 RM 代理的实时 REST）。仅支持免 Kerberos（SPNEGO）的 HTTP 端点',
   ),
 })
 
@@ -142,5 +150,6 @@ export function readCdhSettings(config?: CdhConfig | null): CdhSettings {
     defaultCluster: text(unwrap(source.defaultCluster), DEFAULTS.defaultCluster),
     yarnRmUrl: text(unwrap(source.yarnRmUrl), DEFAULTS.yarnRmUrl),
     yarnJhsUrl: text(unwrap(source.yarnJhsUrl), DEFAULTS.yarnJhsUrl),
+    sparkHistoryUrl: text(unwrap(source.sparkHistoryUrl), DEFAULTS.sparkHistoryUrl),
   }
 }

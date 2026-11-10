@@ -71,13 +71,26 @@ export interface PublicSettings {
   defaultCluster: string
   yarnRmUrl: string
   yarnJhsUrl: string
+  sparkHistoryUrl: string
   hasPassword: boolean
 }
 
 /** 分发器入参：端点 + 参数对象。 */
 export function createRpcDispatcher(
   dispatch: Dispatch,
-  settings: () => { host: string; port: number; username: string; password: string; useTls: boolean; apiVersion: string; timeoutMs: number; defaultCluster: string; yarnRmUrl: string; yarnJhsUrl: string },
+  settings: () => {
+    host: string
+    port: number
+    username: string
+    password: string
+    useTls: boolean
+    apiVersion: string
+    timeoutMs: number
+    defaultCluster: string
+    yarnRmUrl: string
+    yarnJhsUrl: string
+    sparkHistoryUrl: string
+  },
 ): (endpoint: string, args: Record<string, unknown>) => Promise<RpcResult> {
   return async function rpcDispatch(endpoint, args): Promise<RpcResult> {
     try {
@@ -97,6 +110,7 @@ export function createRpcDispatcher(
             defaultCluster: snap.defaultCluster,
             yarnRmUrl: snap.yarnRmUrl,
             yarnJhsUrl: snap.yarnJhsUrl,
+            sparkHistoryUrl: snap.sparkHistoryUrl,
             hasPassword: Boolean(snap.password),
           }
           return ok(publicSettings)

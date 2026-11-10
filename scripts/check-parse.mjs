@@ -140,6 +140,26 @@ assert.equal(haDerived.ha, true)
 assert.equal(haDerived.rmId, 'rm1')
 assert.equal(haDerived.rmUrl, 'http://rm1host:8088', 'HA 取第一个 rm-id')
 
+// 引擎原生日志纯函数：Flink 文件/ TM 清单、Spark executorLogs、容器日志尾部 URL
+assert.deepEqual(
+  analysis.flinkLogFiles({ logs: [{ name: 'jobmanager.log', size: 12, mtime: 1 }, { name: '' }] }),
+  [{ name: 'jobmanager.log', size: 12, mtime: 1 }],
+)
+assert.deepEqual(analysis.flinkLogFiles([{ name: 'taskmanager.err' }]), [{ name: 'taskmanager.err', size: null, mtime: null }])
+assert.deepEqual(analysis.flinkTaskManagerIds([{ id: 'tm-1' }, { id: 'tm-2' }, { id: 'tm-1' }]), ['tm-1', 'tm-2'])
+assert.deepEqual(analysis.flinkTaskManagerIds({ taskmanagers: [{ id: 'tm-9' }] }), ['tm-9'])
+const sparkExec = analysis.sparkExecutors([
+  { id: 'driver', hostPort: 'h1:1', isActive: true, executorLogs: { stderr: 'http://nm:8042/node/containerlogs/c1/u/stderr' } },
+  { id: '1', hostPort: 'h2:2', isActive: false, executorLogs: { stdout: 'http://nm:8042/node/containerlogs/c2/u/stdout', stderr: '' } },
+])
+assert.equal(sparkExec.length, 2)
+assert.deepEqual(sparkExec[0].logs, { stderr: 'http://nm:8042/node/containerlogs/c1/u/stderr' })
+assert.equal(sparkExec[1].active, false)
+const tailUrl = new URL(analysis.containerLogTailUrl('http://nm:8042/node/containerlogs/c1/u/stderr?start=-1', 4096, 'alice'))
+assert.equal(tailUrl.searchParams.get('start'), '-4096', 'start 应被覆盖为请求的尾部字节数')
+assert.equal(tailUrl.searchParams.get('user.name'), 'alice', '非安全模式需补 user.name')
+assert.equal(analysis.containerLogTailUrl('not a url', 1, 'u'), 'not a url')
+
 // 分类/动作表自洽
 const service = await import('../lib/service.js')
 const actions = service.describeCategories()
@@ -155,7 +175,7 @@ assert.deepEqual(Object.keys(actions), [
   'yarn',
 ])
 assert.ok(actions.diagnosis.includes('impala'))
-assert.deepEqual([...actions.yarn], ['apps', 'app', 'attempts', 'logs', 'diagnose'])
+assert.deepEqual([...actions.yarn], ['apps', 'app', 'attempts', 'logs', 'flink_logs', 'spark_logs', 'diagnose'])
 
 // 未配置主机时给出可读错误（不联网）
 const dispatch = service.createDispatcher(() => ({
@@ -187,6 +207,7 @@ const dispatchYarn = service.createDispatcher(() => ({
   defaultCluster: '',
   yarnRmUrl: '',
   yarnJhsUrl: '',
+  sparkHistoryUrl: '',
 }))
 await assert.rejects(() => dispatchYarn('yarn', 'logs', { application_id: 'application_x' }), /yarnJhsUrl/)
 await assert.rejects(() => dispatchYarn('yarn', 'attempts', { application_id: 'application_x' }), /yarnRmUrl/)
@@ -231,11 +252,136 @@ const dispatchDerived = service.createDispatcher(() => ({
   defaultCluster: 'cluster1',
   yarnRmUrl: '',
   yarnJhsUrl: '',
+  sparkHistoryUrl: '',
 }))
 const attemptsResult = await dispatchDerived('yarn', 'attempts', { application_id: 'application_x', service_name: 'yarn1' })
 assert.equal(attemptsResult.attemptCount, 1)
 assert.equal(attemptsResult.latest.containerId, 'container_x_01_000001')
 assert.ok(seenUrls.some((u) => u.includes('/configFiles/yarn-site.xml')), '应读 yarn-site.xml 推导地址')
+
+// 离线验证引擎原生日志拆分：Flink JobManager/TaskManager、Spark driver/executor。
+// 大文件用超长内容验证滚动尾部（只保留末尾字节，不把整文件堆进内存/结果）。
+const longTail = `HEAD_MARKER\n${'x'.repeat(70000)}\nTAIL_MARKER\n`
+globalThis.fetch = async (url) => {
+  const u = String(url)
+  seenUrls.push(u)
+  const parsed = new URL(u)
+  const path = parsed.pathname
+  if (path === '/ws/v1/cluster/apps/application_flink_0001') {
+    return jsonResponse({
+      app: {
+        id: 'application_flink_0001',
+        applicationType: 'FLINK',
+        state: 'RUNNING',
+        finalStatus: 'UNDEFINED',
+        trackingUrl: 'http://rm1.example.com:8088/proxy/application_flink_0001/',
+        user: 'flinkuser',
+      },
+    })
+  }
+  if (path === '/proxy/application_flink_0001/jobmanager/logs') {
+    return jsonResponse({ logs: [{ name: 'jobmanager.log', size: 10 }, { name: 'jobmanager.out', size: 1 }] })
+  }
+  if (path === '/proxy/application_flink_0001/jobmanager/logs/jobmanager.log') {
+    return new Response('2026-01-01 INFO start\n2026-01-01 ERROR boom\n', { status: 200 })
+  }
+  if (path === '/proxy/application_flink_0001/taskmanagers') {
+    return jsonResponse([{ id: 'tm-1' }, { id: 'tm-2' }])
+  }
+  if (path.startsWith('/proxy/application_flink_0001/taskmanagers/') && path.endsWith('/logs')) {
+    return jsonResponse({ logs: [{ name: 'taskmanager.log' }] })
+  }
+  if (path === '/proxy/application_flink_0001/taskmanagers/tm-2/logs/taskmanager.log') {
+    return new Response(longTail, { status: 200 })
+  }
+  if (path.startsWith('/proxy/application_flink_0001/taskmanagers/') && path.endsWith('/logs/taskmanager.log')) {
+    return new Response('tm log line\n', { status: 200 })
+  }
+  if (path === '/ws/v1/cluster/apps/application_spark_0001') {
+    return jsonResponse({
+      app: {
+        id: 'application_spark_0001',
+        applicationType: 'SPARK',
+        state: 'FINISHED',
+        finalStatus: 'FAILED',
+        trackingUrl: 'http://rm1.example.com:8088/proxy/application_spark_0001/',
+        user: 'sparkuser',
+      },
+    })
+  }
+  if (path === '/api/v1/applications/application_spark_0001/executors') {
+    assert.equal(parsed.host, 'shs.example.com:18080', '已完成作业应走 Spark History Server')
+    return jsonResponse([
+      {
+        id: '1',
+        hostPort: 'n1:1',
+        isActive: false,
+        executorLogs: { stderr: 'http://nm1.example.com:8042/node/containerlogs/c1/sparkuser/stderr' },
+      },
+      {
+        id: 'driver',
+        hostPort: 'n0:0',
+        isActive: false,
+        executorLogs: { stderr: 'http://nm0.example.com:8042/node/containerlogs/c0/sparkuser/stderr' },
+      },
+      {
+        id: '2',
+        hostPort: 'n2:2',
+        isActive: false,
+        executorLogs: { stdout: 'http://nm2.example.com:8042/node/containerlogs/c2/sparkuser/stdout' },
+      },
+    ])
+  }
+  if (path.startsWith('/node/containerlogs/')) {
+    assert.equal(parsed.searchParams.get('user.name'), 'sparkuser', '容器日志应补 user.name')
+    assert.ok(parsed.searchParams.get('start').startsWith('-'), '容器日志应带负 start 取尾部')
+    return new Response('<html><body><pre>ERROR executor failed\nstack line</pre></body></html>', { status: 200 })
+  }
+  throw new Error(`offline smoke: unexpected fetch ${u}`)
+}
+const dispatchEngine = service.createDispatcher(() => ({
+  host: 'cm.example.com',
+  port: 7180,
+  username: 'admin',
+  password: '',
+  useTls: false,
+  apiVersion: 'v41',
+  timeoutMs: 30000,
+  defaultCluster: '',
+  yarnRmUrl: 'http://rm1.example.com:8088',
+  yarnJhsUrl: 'http://jhs1.example.com:19888',
+  sparkHistoryUrl: 'http://shs.example.com:18080',
+}))
+const flinkResult = await dispatchEngine('yarn', 'flink_logs', {
+  application_id: 'application_flink_0001',
+  lines: 5,
+})
+assert.equal(flinkResult.engine, 'flink')
+assert.equal(flinkResult.jobManager.fetchedFileCount, 1, '默认只取 *.log，跳过 .out')
+assert.ok(flinkResult.jobManager.files[0].log.includes('ERROR boom'))
+assert.equal(flinkResult.taskManagerCount, 2)
+assert.equal(flinkResult.taskManagers.length, 2)
+assert.ok(flinkResult.taskManagers[1].files[0].log.includes('TAIL_MARKER'), '滚动缓冲应保留文件末尾')
+assert.ok(!flinkResult.taskManagers[1].files[0].log.includes('HEAD_MARKER'), '滚动缓冲应丢弃超大文件头部')
+
+const sparkResult = await dispatchEngine('yarn', 'spark_logs', {
+  application_id: 'application_spark_0001',
+  lines: 5,
+})
+assert.equal(sparkResult.engine, 'spark')
+assert.equal(sparkResult.source, 'spark-history-server')
+assert.equal(sparkResult.executorCount, 3)
+assert.equal(sparkResult.executors[0].id, 'driver', 'driver 应排在最前')
+assert.ok(sparkResult.executors[0].log.includes('ERROR executor failed'))
+assert.ok(
+  sparkResult.executors.some((item) => typeof item.error === 'string' && item.error.includes('stdout')),
+  '缺 stderr 的 executor 应给出可读 error',
+)
+const filteredSpark = await dispatchEngine('yarn', 'spark_logs', {
+  application_id: 'application_spark_0001',
+  executor_id: 'driver',
+})
+assert.equal(filteredSpark.fetchedExecutorCount, 1)
 globalThis.fetch = realFetch
 
 // 内置 skills：注册清单是事实来源，名称/描述合法、正文 md 是发布物且覆盖关键纠错点
@@ -283,6 +429,10 @@ for (const must of [
   'SPNEGO', // Kerberos 限制
   'yarn-site.xml', // 地址自动推导来源
   '自动推导', // 手动优先、CM 兜底
+  'flink_logs', // Flink 按 JobManager/TaskManager 拆分
+  'spark_logs', // Spark 按 driver/executor 拆分
+  'sparkHistoryUrl', // 已完成 Spark 作业的 History Server 前提
+  'executorLogs', // Spark REST 日志 URL 来源
 ]) {
   assert.ok(yarnJobsMd.includes(must), `cdh-yarn-jobs 正文缺少关键点: ${must}`)
 }

@@ -25,16 +25,18 @@ DeepSeek Harness (dsh) 插件：**只读**诊断 Cloudera Manager / CDH 集群�
 | `events` | `query` / `alerts` / `build_query` | 事件查询语法、近 N 小时告警 |
 | `metrics` | `query` / `list` / `service` / `host` | 时序指标检索与查询 |
 | `diagnosis` | `overview` / `hdfs` / `yarn` / `impala` / `command_status` / `command_logs` | 集群评分与专项诊断 |
-| `yarn` | `apps` / `app` / `attempts` / `logs` / `diagnose` | Spark/Flink/Hive on YARN 作业失败诊断与容器日志取证 |
+| `yarn` | `apps` / `app` / `attempts` / `logs` / `flink_logs` / `spark_logs` / `diagnose` | Spark/Flink/Hive on YARN 作业失败诊断与按组件/容器日志取证 |
 
 `diagnosis/overview` 汇总服务、主机、告警三方面给出 0–100 健康评分与处理建议；
 `hdfs` / `yarn` / `impala` 为专项诊断（容量、副本、资源争抢、失败 SQL 聚合等）。
 
 `yarn` 分类面向**作业级**取证（区别于 `diagnosis/yarn` 的服务级健康）：`apps` 走 CM `yarnApplications`
 找失败作业（无需额外配置）；`app`/`attempts`/`logs`/`diagnose` 经 ResourceManager REST 取 `diagnostics`
-与 AM 容器位置、经 JobHistory Server 取聚合容器日志正文。`yarnRmUrl`/`yarnJhsUrl` 手动配置优先，
-留空时自动从 CM 下发的 `yarn-site.xml` 推导（`yarn.resourcemanager.webapp.address` / `yarn.log.server.url`，
-处理 `0.0.0.0` 绑定地址与 HA）；仅支持免 Kerberos 的 HTTP 端点。详见 skill `cdh-yarn-jobs`。
+与 AM 容器位置、经 JobHistory Server 取聚合容器日志正文；`flink_logs` / `spark_logs` 走引擎自带 REST
+按组件拆分日志（Flink 的 JobManager 与各 TaskManager；Spark 的 driver 与各 executor）。`yarnRmUrl`/`yarnJhsUrl`
+手动配置优先，留空时自动从 CM 下发的 `yarn-site.xml` 推导（`yarn.resourcemanager.webapp.address` /
+`yarn.log.server.url`，处理 `0.0.0.0` 绑定地址与 HA）；`sparkHistoryUrl` 留空时从 CM Spark 角色的 Web UI
+地址（`roleUrl`）推导。仅支持免 Kerberos 的 HTTP 端点。详见 skill `cdh-yarn-jobs`。
 
 ### 内置排查 skills
 
@@ -49,7 +51,7 @@ CDH 故障里大量涉及 CPU / 内存 / IO / Linux 内核 / Java 进程 OOM / Y
 | `cdh-disk-io` | IO 延迟 / 磁盘将满 / DataNode 掉盘 / HDFS 变慢 | [skills/cdh-disk-io.md](skills/cdh-disk-io.md) |
 | `cdh-linux-kernel` | 进程无故消失 / 时钟偏移 / fd 耗尽 / 内核参数核对 | [skills/cdh-linux-kernel.md](skills/cdh-linux-kernel.md) |
 | `cdh-jvm-oom` | `OutOfMemoryError` / GC 停顿 / 角色僵死或重启 | [skills/cdh-jvm-oom.md](skills/cdh-jvm-oom.md) |
-| `cdh-yarn-jobs` | Spark/Flink/Hive on YARN 作业失败 / 取容器或作业日志 | [skills/cdh-yarn-jobs.md](skills/cdh-yarn-jobs.md) |
+| `cdh-yarn-jobs` | Spark/Flink/Hive on YARN 作业失败 / 按组件或容器取作业日志 | [skills/cdh-yarn-jobs.md](skills/cdh-yarn-jobs.md) |
 
 设计要点：
 
@@ -101,6 +103,7 @@ CDH 故障里大量涉及 CPU / 内存 / IO / Linux 内核 / Java 进程 OOM / Y
 | `defaultCluster` | 空 | 工具省略 `cluster_name` 时使用；留空自动取第一个集群 |
 | `yarnRmUrl` | 空 | ResourceManager Web 基址（`http://rm:8088`）：取作业 diagnostics 与 AM 容器位置；留空自动从 CM `yarn-site.xml` 推导，推导失败才退回 CM 元数据 |
 | `yarnJhsUrl` | 空 | JobHistory Server 基址（`http://jhs:19888`，可粘贴 `yarn.log.server.url`）：取聚合容器日志正文；留空自动从 CM `yarn-site.xml` 推导 |
+| `sparkHistoryUrl` | 空 | Spark History Server 基址（`http://shs:18080`）：取已结束 Spark 作业的 executor 日志；留空自动从 CM Spark 角色 Web UI 地址推导；运行中作业不需要 |
 
 ## 开发
 
@@ -127,7 +130,7 @@ src/
   rpc.ts        /api/cdh/* 精确路由与 RPC 信封
   tool.ts       cdh agent 工具定义
   cm-client.ts  Cloudera Manager REST 客户端
-  yarn-client.ts  YARN Web 只读客户端（ResourceManager REST + JobHistory 聚合日志）
+  yarn-client.ts  YARN Web 只读客户端（ResourceManager REST + JobHistory 聚合日志 + Flink/Spark 引擎 REST）
   analysis.ts   健康度/指标/事件查询/YARN 日志提取等公共逻辑
   skill.ts      内置 skills 的注册清单（BUILTIN_SKILLS）与装配
   client.ts     浏览器半设置面板（bundle 模块体）

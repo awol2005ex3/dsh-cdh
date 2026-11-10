@@ -15,6 +15,8 @@ import {
   deriveYarnUrlsFromProps,
   extractErrorLines,
   extractLogText,
+  flinkLogFiles,
+  flinkTaskManagerIds,
   hostStatusIssue,
   itemsOf,
   latestAttempt,
@@ -29,8 +31,10 @@ import {
   resolveClusterName,
   rmAppAttempts,
   runStateIssue,
+  sparkExecutors,
   str,
   webappAddressToUrl,
+  type EngineLogFile,
   type HealthProblem,
   type Severity,
 } from './analysis.js'
@@ -67,7 +71,7 @@ export const CDH_ACTIONS: Record<CdhCategory, readonly string[]> = {
   events: ['query', 'alerts', 'build_query'],
   metrics: ['query', 'list', 'service', 'host'],
   diagnosis: ['overview', 'hdfs', 'yarn', 'impala', 'command_status', 'command_logs'],
-  yarn: ['apps', 'app', 'attempts', 'logs', 'diagnose'],
+  yarn: ['apps', 'app', 'attempts', 'logs', 'flink_logs', 'spark_logs', 'diagnose'],
 }
 
 /** 分发器（浏览器 RPC 与 agent 工具共用）。 */
@@ -1265,6 +1269,114 @@ async function resolveYarnTargets(ctx: Context): Promise<void> {
   }
 }
 
+/**
+ * 手动配置优先，留空时从 CM 推导 Spark History Server 地址：Spark 服务下带 HISTORY 的
+ * 角色（CDH 为 SPARK_YARN_HISTORY_SERVER）的 roleUrl 即其 Web UI 根地址。
+ * 推导目标仍是所配置集群自身的角色地址，不引入运行时 host/URL。
+ */
+async function resolveSparkHistoryUrl(ctx: Context): Promise<void> {
+  if (ctx.yarn.hasSparkHistory) return
+  try {
+    const cluster = await clusterName(ctx, {})
+    const services = itemsOf(await ctx.client.get(`/clusters/${encodeURIComponent(cluster)}/services`, [], ctx.signal))
+    const sparkService = services
+      .map((item) => obj(item))
+      .find((item) => ['SPARK', 'SPARK_ON_YARN'].includes(str(item.type).toUpperCase()))
+    if (!sparkService) return
+    const serviceName = str(sparkService.name)
+    if (!serviceName) return
+    const roles = itemsOf(
+      await ctx.client.get(
+        `/clusters/${encodeURIComponent(cluster)}/services/${encodeURIComponent(serviceName)}/roles`,
+        [],
+        ctx.signal,
+      ),
+    )
+    const historyRole = roles
+      .map((item) => obj(item))
+      .find((item) => str(item.type).toUpperCase().includes('HISTORY') && str(item.roleUrl).trim())
+    if (!historyRole) return
+    const url = str(historyRole.roleUrl).trim()
+    ctx.yarn.fillDerived('', '', url)
+    if (ctx.yarn.hasSparkHistory) {
+      ctx.warnings.push(`Spark History 地址未手动配置，已从 CM 角色 ${str(historyRole.name)} 的 Web UI 地址推导：${url}`)
+    }
+  } catch (err) {
+    ctx.warnings.push(`从 CM 推导 Spark History 地址失败（降级为仅手动配置）：${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** 引擎日志每个组件最多读取的文件数（log/out/err 等，6 足以覆盖）。 */
+const MAX_ENGINE_FILES = 6
+
+/** YARN 作业是否仍在运行：finalStatus 已确定（非 UNDEFINED）即结束，否则看 state。 */
+function appIsLive(app: Record<string, unknown>): boolean {
+  const final = str(app.finalStatus).toUpperCase()
+  if (final && final !== 'UNDEFINED') return false
+  const state = str(app.state).toUpperCase()
+  return state === '' || ['NEW', 'NEW_SAVING', 'SUBMITTED', 'ACCEPTED', 'RUNNING'].includes(state)
+}
+
+/**
+ * 引擎 Web 基址：RM 跟踪地址优先（运行期实时、经 RM 代理，天然限定在配置集群内），
+ * 退回 AM 的 HTTP 地址（Flink 用 amHostHttpAddress 直连 JobManager）。
+ */
+function engineBaseFromApp(app: Record<string, unknown>): string {
+  const tracking = str(app.trackingUrl).trim()
+  if (tracking) return tracking
+  const am = str(app.amHostHttpAddress).trim()
+  if (!am) return ''
+  return /^https?:\/\//i.test(am) ? am : `http://${am}`
+}
+
+/** 按文件名子串过滤并限流；filter 为空表示全部（默认 'log' 只取主日志，跳过 .out/.err 噪声）。 */
+function selectLogFiles(files: EngineLogFile[], filter: string): EngineLogFile[] {
+  const wanted = filter.trim().toLowerCase()
+  const matched = wanted ? files.filter((file) => file.name.toLowerCase().includes(wanted)) : files
+  return matched.slice(0, MAX_ENGINE_FILES)
+}
+
+interface EngineLogFetch {
+  name: string
+  size: number | null
+  mtime: number | null
+  totalLines: number
+  returnedLines: number
+  errorLines: string[]
+  log: string
+  error?: string
+}
+
+/** 取单个引擎日志文件尾部；单个文件失败折叠为 error，不拖垮其余组件。 */
+async function fetchEngineLogFile(
+  ctx: Context,
+  base: string,
+  path: string,
+  file: EngineLogFile,
+  lines: number,
+): Promise<EngineLogFetch> {
+  try {
+    const text = await ctx.yarn.engineTextTail(base, path, logChunkBytes(lines), ctx.signal)
+    const tail = tailLines(text, lines)
+    return {
+      ...file,
+      totalLines: tail.total,
+      returnedLines: tail.lines.length,
+      errorLines: extractErrorLines(text, 20),
+      log: truncate(tail.lines.join('\n'), MAX_TEXT_CHARS),
+    }
+  } catch (err) {
+    return {
+      ...file,
+      totalLines: 0,
+      returnedLines: 0,
+      errorLines: [],
+      log: '',
+      error: err instanceof Error ? err.message : String(err),
+    }
+  }
+}
+
 /** 归一化 CM ApiYarnApplication 行。 */
 function mapCmYarnApp(row: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -1472,6 +1584,259 @@ async function yarnAction(ctx: Context, action: string, args: Record<string, unk
       }
     }
 
+    case 'flink_logs': {
+      requireRm(ctx)
+      const appId = requireStr(args, 'application_id', '如 application_1700000000000_0001')
+      const component = str(args.component).trim().toLowerCase() || 'all'
+      if (!['all', 'jobmanager', 'taskmanager'].includes(component)) {
+        throw new Error('component 仅支持 all / jobmanager / taskmanager')
+      }
+      const taskManagerId = str(args.taskmanager_id).trim()
+      const rawFile = str(args.file).trim()
+      // 默认只取主日志（*.log）；file:"all" / "*" 取全部，含 .out/.err
+      const fileFilter = rawFile === '*' || rawFile.toLowerCase() === 'all' ? '' : rawFile || 'log'
+      const lines = Math.max(1, Math.min(5000, Math.floor(num(args.lines) ?? 200)))
+      const limit = Math.max(1, Math.min(50, Math.floor(num(args.limit) ?? 5)))
+
+      const app = obj(obj(await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}`, [], ctx.signal)).app)
+      const appType = str(app.applicationType).toUpperCase()
+      if (appType && !appType.includes('FLINK')) {
+        throw new Error(`作业 applicationType=${appType} 不是 Flink；Spark 作业请用 yarn/spark_logs，其他类型用 yarn/logs`)
+      }
+      if (!appIsLive(app)) {
+        throw new Error(
+          `Flink JobManager REST 只在作业运行期间可用（当前 state=${str(app.state, '?')} finalStatus=${str(app.finalStatus, '?')}）：` +
+            '已结束的作业请用 yarn/logs 取 JHS 聚合的 JobManager（AM）容器日志；TaskManager 日志只能在运行期间抓取',
+        )
+      }
+      const base = engineBaseFromApp(app)
+      if (!base) {
+        throw new Error('ResourceManager 未返回 trackingUrl / amHostHttpAddress，无法定位 Flink JobManager Web API')
+      }
+
+      const wantJobManager = component !== 'taskmanager'
+      const wantTaskManagers = component !== 'jobmanager'
+      let jobManager: Record<string, unknown> | null = null
+      let taskManagerCount = 0
+      const taskManagers: unknown[] = []
+
+      if (wantJobManager) {
+        const listed = flinkLogFiles(await ctx.yarn.engineGetJson(base, '/jobmanager/logs', ctx.signal))
+        const selected = selectLogFiles(listed, fileFilter)
+        if (listed.length === 0) {
+          ctx.warnings.push('JobManager 未返回日志文件清单（检查作业是否仍在运行、REST 是否可达）')
+        } else if (selected.length === 0) {
+          ctx.warnings.push(`JobManager 日志文件名不含 "${fileFilter}"（可用：${listed.map((file) => file.name).join(', ')}）`)
+        }
+        const files: EngineLogFetch[] = []
+        for (const file of selected) {
+          files.push(await fetchEngineLogFile(ctx, base, `/jobmanager/logs/${encodeURIComponent(file.name)}`, file, lines))
+        }
+        jobManager = { fileCount: listed.length, fetchedFileCount: files.length, files }
+      }
+
+      if (wantTaskManagers) {
+        let ids: string[] = []
+        try {
+          ids = flinkTaskManagerIds(await ctx.yarn.engineGetJson(base, '/taskmanagers', ctx.signal))
+        } catch (err) {
+          // TaskManager 清单失败不拖垮已取到的 JobManager 日志
+          ctx.warnings.push(`Flink TaskManager 清单获取失败（降级为仅 JobManager 日志）：${err instanceof Error ? err.message : String(err)}`)
+        }
+        taskManagerCount = ids.length
+        const matched = taskManagerId ? ids.filter((id) => id === taskManagerId || id.includes(taskManagerId)) : ids
+        const selectedIds = matched.slice(0, limit)
+        if (taskManagerId && matched.length === 0) {
+          ctx.warnings.push(`taskmanager_id="${taskManagerId}" 未匹配（共 ${ids.length} 个：${ids.join(', ') || '无'}）`)
+        } else if (!taskManagerId && ids.length > limit) {
+          ctx.warnings.push(`TaskManager 共 ${ids.length} 个，仅取前 ${limit} 个（用 taskmanager_id 指定或调大 limit）`)
+        }
+        for (const id of selectedIds) {
+          try {
+            const listed = flinkLogFiles(
+              await ctx.yarn.engineGetJson(base, `/taskmanagers/${encodeURIComponent(id)}/logs`, ctx.signal),
+            )
+            const files: EngineLogFetch[] = []
+            for (const file of selectLogFiles(listed, fileFilter)) {
+              files.push(
+                await fetchEngineLogFile(
+                  ctx,
+                  base,
+                  `/taskmanagers/${encodeURIComponent(id)}/logs/${encodeURIComponent(file.name)}`,
+                  file,
+                  lines,
+                ),
+              )
+            }
+            taskManagers.push({ id, fileCount: listed.length, files })
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err)
+            ctx.warnings.push(`TaskManager ${id} 日志清单获取失败（降级）：${message}`)
+            taskManagers.push({ id, files: [], error: message })
+          }
+        }
+      }
+
+      return {
+        applicationId: appId,
+        engine: 'flink',
+        baseUrl: base,
+        app: {
+          name: str(app.name),
+          user: str(app.user),
+          state: str(app.state),
+          applicationType: str(app.applicationType),
+        },
+        jobManager,
+        taskManagerCount,
+        fetchedTaskManagerCount: taskManagers.length,
+        taskManagers,
+        warnings: ctx.warnings,
+        message:
+          `Flink 作业 ${appId} 引擎日志取证完成：JobManager ${wantJobManager ? '已取' : '未取'}，` +
+          `TaskManager ${taskManagers.length}/${taskManagerCount} 个；REST 仅作业运行期间可用，且需免 Kerberos（SPNEGO）`,
+      }
+    }
+
+    case 'spark_logs': {
+      const appId = requireStr(args, 'application_id', '如 application_1700000000000_0001')
+      const logType = str(args.log_type).trim().toLowerCase() || 'stderr'
+      if (logType !== 'stderr' && logType !== 'stdout') throw new Error('log_type 仅支持 stderr 或 stdout')
+      const executorFilter = str(args.executor_id).trim()
+      const lines = Math.max(1, Math.min(5000, Math.floor(num(args.lines) ?? 200)))
+      const limit = Math.max(1, Math.min(50, Math.floor(num(args.limit) ?? 10)))
+
+      let app: Record<string, unknown> = {}
+      let user = str(args.user).trim()
+      if (ctx.yarn.hasRm) {
+        try {
+          app = obj(obj(await ctx.yarn.rmGet(`apps/${encodeURIComponent(appId)}`, [], ctx.signal)).app)
+          if (!user) user = str(app.user)
+        } catch (err) {
+          ctx.warnings.push(`ResourceManager 未返回作业信息（可能已被清理，改查 History Server）：${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+      const appType = str(app.applicationType).toUpperCase()
+      if (appType && !appType.includes('SPARK')) {
+        ctx.warnings.push(`applicationType=${appType} 不是 SPARK，结果可能为空；Flink 作业请用 yarn/flink_logs`)
+      }
+
+      // 运行中作业走 RM 代理拿实时 executor 列表；已结束或 RM 无记录时走 Spark History Server
+      let base = ''
+      let source = ''
+      if (appIsLive(app)) {
+        const liveBase = engineBaseFromApp(app)
+        if (liveBase) {
+          base = liveBase
+          source = 'resourcemanager-proxy'
+        }
+      }
+      if (!base) {
+        await resolveSparkHistoryUrl(ctx)
+        if (ctx.yarn.hasSparkHistory) {
+          base = ctx.yarn.sparkHistoryUrl
+          source = 'spark-history-server'
+        }
+      }
+      if (!base) {
+        throw new Error(
+          '未能定位 Spark REST：运行中作业需要 yarnRmUrl（默认从 CM 推导）；' +
+            '已完成/失败作业需要 Spark History Server 地址（设置 sparkHistoryUrl，或由 CM Spark 角色 Web UI 自动推导），' +
+            '否则请先用 yarn/logs 取 driver（AM）容器日志',
+        )
+      }
+
+      const executorsPath = `/api/v1/applications/${encodeURIComponent(appId)}/executors`
+      let executorsRaw: unknown
+      try {
+        executorsRaw = await ctx.yarn.engineGetJson(base, executorsPath, ctx.signal)
+      } catch (err) {
+        // RM 代理不可用时，已配置/可推导的 History Server 仍能给出 executor 列表（含运行中作业）
+        if (source !== 'resourcemanager-proxy') throw err
+        await resolveSparkHistoryUrl(ctx)
+        if (!ctx.yarn.hasSparkHistory) throw err
+        ctx.warnings.push(
+          `RM 代理取 Spark executor 列表失败（${err instanceof Error ? err.message : String(err)}），改走 Spark History Server`,
+        )
+        base = ctx.yarn.sparkHistoryUrl
+        source = 'spark-history-server'
+        executorsRaw = await ctx.yarn.engineGetJson(base, executorsPath, ctx.signal)
+      }
+      const executors = sparkExecutors(executorsRaw)
+      if (executors.length === 0) {
+        ctx.warnings.push('REST 未返回 executor 列表（作业刚启动、History Server 尚未收录，或 event log 未记录日志 URL）')
+      }
+      // driver 排在最前：失败根因多数在 driver 日志里
+      executors.sort((a, b) => (a.id === 'driver' ? -1 : b.id === 'driver' ? 1 : 0))
+      const selected = executorFilter ? executors.filter((item) => item.id === executorFilter) : executors.slice(0, limit)
+      if (executorFilter && selected.length === 0) {
+        ctx.warnings.push(`executor_id="${executorFilter}" 未匹配（可用：${executors.map((item) => item.id).join(', ') || '无'}）`)
+      } else if (!executorFilter && executors.length > limit) {
+        ctx.warnings.push(`共 ${executors.length} 个 executor，仅取前 ${limit} 个（用 executor_id 指定或调大 limit）`)
+      }
+
+      const results: unknown[] = []
+      let fallbackWarned = false
+      for (const executor of selected) {
+        const rawLogUrl = executor.logs[logType] ?? executor.logs[logType.toUpperCase()] ?? ''
+        if (!rawLogUrl) {
+          results.push({
+            id: executor.id,
+            hostPort: executor.hostPort,
+            active: executor.active,
+            error: `executorLogs 未提供 ${logType} URL（可用：${Object.keys(executor.logs).join(', ') || '无'}）`,
+          })
+          continue
+        }
+        try {
+          const fetched = await ctx.yarn.containerLogHtml(rawLogUrl, logChunkBytes(lines), user, ctx.signal)
+          const extracted = extractLogText(fetched.html)
+          if (extracted.source === 'fallback' && !fallbackWarned) {
+            fallbackWarned = true
+            ctx.warnings.push('NM/JHS 未返回 <pre> 日志正文（可能 ACL 拒绝或日志已删除），已回退为页面文本')
+          }
+          const tail = tailLines(extracted.text, lines)
+          results.push({
+            id: executor.id,
+            hostPort: executor.hostPort,
+            active: executor.active,
+            logUrl: fetched.url,
+            source: extracted.source,
+            totalLines: tail.total,
+            returnedLines: tail.lines.length,
+            errorLines: extractErrorLines(extracted.text, 20),
+            log: truncate(tail.lines.join('\n'), MAX_TEXT_CHARS),
+          })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          ctx.warnings.push(`executor ${executor.id} 日志获取失败（降级）：${message}`)
+          results.push({ id: executor.id, hostPort: executor.hostPort, active: executor.active, logUrl: rawLogUrl, error: message })
+        }
+      }
+
+      return {
+        applicationId: appId,
+        engine: 'spark',
+        baseUrl: base,
+        source,
+        logType,
+        app: {
+          name: str(app.name),
+          user,
+          state: str(app.state),
+          finalStatus: str(app.finalStatus),
+          applicationType: str(app.applicationType),
+        },
+        executorCount: executors.length,
+        fetchedExecutorCount: results.length,
+        executors: results,
+        warnings: ctx.warnings,
+        message:
+          `Spark 作业 ${appId} 引擎日志取证完成：取 ${results.length}/${executors.length} 个 executor 的 ${logType}；` +
+          `运行中作业走 RM 代理，已结束作业需 Spark History Server（仅免 Kerberos 的 HTTP 端点）`,
+      }
+    }
+
     case 'diagnose': {
       const appId = requireStr(args, 'application_id', '如 application_1700000000000_0001')
       const lines = Math.max(1, Math.min(2000, Math.floor(num(args.lines) ?? 200)))
@@ -1517,6 +1882,11 @@ async function yarnAction(ctx: Context, action: string, args: Record<string, unk
         ctx.warnings.push('未能获得 yarnRmUrl（未配置且自动推导失败）：diagnostics 失败摘要不可用，已退回 CM 元数据')
       }
 
+      if (appIsLive(appInfo)) {
+        ctx.warnings.push(
+          '作业仍在运行：JHS 聚合日志可能尚未完成，实时组件日志请用 yarn/flink_logs（Flink）或 yarn/spark_logs（Spark）',
+        )
+      }
       if (finalStatus === 'FAILED') {
         findings.push({ check: 'APP_FAILED', level: 'BAD', detail: '作业最终状态 FAILED' })
       } else if (finalStatus === 'KILLED') {

@@ -102,6 +102,7 @@ interface CdhFormValue {
   defaultCluster: string
   yarnRmUrl: string
   yarnJhsUrl: string
+  sparkHistoryUrl: string
 }
 
 interface SettingsChannel {
@@ -178,6 +179,7 @@ function configFormsChannel(ctx: any): SettingsChannel | undefined {
         defaultCluster: typeof value.defaultCluster === 'string' ? value.defaultCluster : undefined,
         yarnRmUrl: typeof value.yarnRmUrl === 'string' ? value.yarnRmUrl : undefined,
         yarnJhsUrl: typeof value.yarnJhsUrl === 'string' ? value.yarnJhsUrl : undefined,
+        sparkHistoryUrl: typeof value.sparkHistoryUrl === 'string' ? value.sparkHistoryUrl : undefined,
       }
     },
     write: async (patch) => {
@@ -205,6 +207,7 @@ function rpcSettingsChannel(conn: any): SettingsChannel | undefined {
         defaultCluster: typeof value.defaultCluster === 'string' ? value.defaultCluster : undefined,
         yarnRmUrl: typeof value.yarnRmUrl === 'string' ? value.yarnRmUrl : undefined,
         yarnJhsUrl: typeof value.yarnJhsUrl === 'string' ? value.yarnJhsUrl : undefined,
+        sparkHistoryUrl: typeof value.sparkHistoryUrl === 'string' ? value.sparkHistoryUrl : undefined,
         hasPassword: value.hasPassword === true,
       }
     },
@@ -298,6 +301,10 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
   const clusterInput = el('input', { placeholder: '留空自动取第一个集群', style: INPUT_CSS }) as HTMLInputElement
   const rmUrlInput = el('input', { placeholder: 'http://rm.example.com:8088（可选）', style: INPUT_CSS }) as HTMLInputElement
   const jhsUrlInput = el('input', { placeholder: 'http://jhs.example.com:19888（可选）', style: INPUT_CSS }) as HTMLInputElement
+  const sparkHistoryInput = el('input', {
+    placeholder: 'http://shs.example.com:18080（可选）',
+    style: INPUT_CSS,
+  }) as HTMLInputElement
 
   const status = el('div', { style: HINT_CSS })
   const output = el('pre', { style: PRE_CSS })
@@ -333,6 +340,7 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
       if (typeof value.defaultCluster === 'string') clusterInput.value = value.defaultCluster
       if (typeof value.yarnRmUrl === 'string') rmUrlInput.value = value.yarnRmUrl
       if (typeof value.yarnJhsUrl === 'string') jhsUrlInput.value = value.yarnJhsUrl
+      if (typeof value.sparkHistoryUrl === 'string') sparkHistoryInput.value = value.sparkHistoryUrl
       hasPassword = value.hasPassword === true || (typeof value.password === 'string' && value.password.length > 0)
       passwordInput.value = ''
       passwordInput.placeholder = hasPassword
@@ -357,6 +365,7 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
     patch.defaultCluster = clusterInput.value.trim()
     patch.yarnRmUrl = rmUrlInput.value.trim()
     patch.yarnJhsUrl = jhsUrlInput.value.trim()
+    patch.sparkHistoryUrl = sparkHistoryInput.value.trim()
     // 密码留空 = 不修改，避免每次保存都把已存密码清空。
     if (includePassword && passwordInput.value.length > 0) patch.password = passwordInput.value
     return patch
@@ -450,6 +459,7 @@ function buildPanel(ctx: any, conn: any): PanelHandle {
     field('默认集群', clusterInput, '工具省略 cluster_name 时使用；留空取第一个集群'),
     field('YARN RM 地址', rmUrlInput, '可选，留空自动从 CM yarn-site.xml 推导。ResourceManager Web 基址，取作业 diagnostics 与 AM 容器位置；仅支持免 Kerberos 的 HTTP'),
     field('YARN JHS 地址', jhsUrlInput, '可选，留空自动从 CM yarn-site.xml 推导。JobHistory Server 基址（可粘贴 yarn.log.server.url），取 Spark/Flink/Hive 容器日志正文'),
+    field('Spark History 地址', sparkHistoryInput, '可选，留空自动从 CM Spark 角色 Web UI 推导。取已完成/失败 Spark 作业的 executor 日志（yarn/spark_logs）；运行中作业走 RM 代理无需它'),
     el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [saveBtn, testBtn, clusterBtn, overviewBtn]),
     status,
     output,

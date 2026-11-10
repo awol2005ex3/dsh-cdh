@@ -32,6 +32,8 @@ export function createCdhTool(dispatch: Dispatch) {
       '{category:"yarn",action:"apps",args:{only_failed:true,application_type:"SPARK"}} 找失败的 Spark/Flink/Hive on YARN 作业（走 CM，无需额外配置）；',
       '{category:"yarn",action:"diagnose",args:{application_id:"application_xxx"}} 单作业失败诊断（diagnostics + AM 容器日志摘要）；',
       '{category:"yarn",action:"logs",args:{application_id:"application_xxx",file:"stderr",lines:300}} 取容器日志正文（yarnRmUrl/yarnJhsUrl 手动配置优先，留空自动从 CM 推导）。',
+      '{category:"yarn",action:"flink_logs",args:{application_id:"application_xxx",component:"all",lines:300}} 按 JobManager/TaskManager 拆分 Flink 日志（引擎 REST，仅作业运行期间可用）；',
+      '{category:"yarn",action:"spark_logs",args:{application_id:"application_xxx",log_type:"stderr",lines:300}} 按 driver/executor 拆分 Spark 日志（运行中走 RM 代理，已结束走 Spark History Server）。',
       '写 metrics/query 的 tsquery 前先加载 skill "cdh-tsquery"（CM tsquery 语法、与 events/query 的区别、指标名核对）；',
       '按故障现象加载排查 skill（各含 cdh 取证序列 + 需运维在主机补执行的命令）：',
       'CPU/load/iowait → "cdh-host-cpu"；内存/swap/主机 OOM 前兆 → "cdh-host-memory"；',
@@ -57,7 +59,8 @@ export function createCdhTool(dispatch: Dispatch) {
         description:
           '操作参数：cluster_name / service_name / role_name / host_id / file_name / log_type / lines / ' +
           'tsquery / filter / hours / severities / query / from / to / limit / command_id / ' +
-          'application_id / application_type / user / only_failed / final_status / node / container_id / entity / file / attempt_id 等，按 action 选取。',
+          'application_id / application_type / user / only_failed / final_status / node / container_id / entity / file / attempt_id / ' +
+          'component / taskmanager_id / executor_id 等，按 action 选取。',
       },
     },
     output: {

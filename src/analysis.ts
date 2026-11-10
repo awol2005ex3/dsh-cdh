@@ -531,3 +531,85 @@ export function deriveYarnUrlsFromProps(props: Map<string, string>): DerivedYarn
   const rmUrl = webappAddressToUrl(rmAddrRaw)
   return { rmUrl, jhsUrl, ha, rmId, rmAddrRaw, needsHostname: rmAddrRaw.length > 0 && rmUrl.length === 0 }
 }
+
+/* ── 引擎原生日志（Flink REST / Spark REST）纯函数 ─────────────────────── */
+
+/** Flink `…/logs` 返回的日志文件条目。 */
+export interface EngineLogFile {
+  name: string
+  size: number | null
+  mtime: number | null
+}
+
+/**
+ * 解析 Flink 的日志文件清单（`/jobmanager/logs`、`/taskmanagers/{id}/logs`：
+ * `{"logs":[{"name","size","mtime"}]}`；直接给数组也兼容）。
+ */
+export function flinkLogFiles(raw: unknown): EngineLogFile[] {
+  const list = Array.isArray(raw) ? raw : Array.isArray(obj(raw).logs) ? (obj(raw).logs as unknown[]) : []
+  const files: EngineLogFile[] = []
+  for (const item of list) {
+    const row = obj(item)
+    const name = str(row.name)
+    if (!name) continue
+    files.push({ name, size: num(row.size) ?? null, mtime: num(row.mtime) ?? null })
+  }
+  return files
+}
+
+/** 解析 Flink `/taskmanagers` 的 id 列表（1.13+ 返回数组，部分版本包在 `{taskmanagers:[…]}` 里）。 */
+export function flinkTaskManagerIds(raw: unknown): string[] {
+  const list = Array.isArray(raw) ? raw : Array.isArray(obj(raw).taskmanagers) ? (obj(raw).taskmanagers as unknown[]) : []
+  const ids: string[] = []
+  for (const item of list) {
+    const id = str(obj(item).id)
+    if (id && !ids.includes(id)) ids.push(id)
+  }
+  return ids
+}
+
+/** Spark executor（`ExecutorSummary` 的日志相关子集）。 */
+export interface SparkExecutor {
+  id: string
+  hostPort: string
+  active: boolean
+  /** 键为 stdout / stderr，值为 NM 或 JHS 的容器日志 URL。 */
+  logs: Record<string, string>
+}
+
+/**
+ * 解析 Spark REST `/api/v1/applications/{id}/executors` 的 `executorLogs`
+ * （`[{id, hostPort, isActive, executorLogs:{stdout,stderr}}]`）。
+ */
+export function sparkExecutors(raw: unknown): SparkExecutor[] {
+  const list = Array.isArray(raw) ? raw : Array.isArray(obj(raw).executors) ? (obj(raw).executors as unknown[]) : []
+  const executors: SparkExecutor[] = []
+  for (const item of list) {
+    const row = obj(item)
+    const id = str(row.id)
+    if (!id) continue
+    const logs: Record<string, string> = {}
+    for (const [key, value] of Object.entries(obj(row.executorLogs))) {
+      const url = str(value)
+      if (url) logs[key] = url
+    }
+    executors.push({ id, hostPort: str(row.hostPort), active: bool(row.isActive), logs })
+  }
+  return executors
+}
+
+/**
+ * 给容器日志 URL 追加尾部参数：`start` 负值表示从文件末尾取字节（NM 与 JHS 都支持），
+ * 非安全模式还需 `user.name` 才能通过 simple auth 的 ACL 校验（已存在则不覆盖）。
+ */
+export function containerLogTailUrl(rawUrl: string, bytes: number, user: string): string {
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    return rawUrl
+  }
+  url.searchParams.set('start', String(-Math.abs(bytes)))
+  if (user && !url.searchParams.has('user.name')) url.searchParams.set('user.name', user)
+  return url.toString()
+}
